@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Virtual environment (recreate with: python -m venv kokoro_env)
+kokoro_env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated interview data (contains candidate PII)
+Job/
+
+# TTS / model cache
+*.onnx
+*.pt
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

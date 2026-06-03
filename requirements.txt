@@ -1,0 +1,12 @@
+opencv-python
+playsound
+simpleaudio
+soundfile
+PyMuPDF
+requests
+python-dotenv
+flask
+flask-socketio
+werkzeug
+RealtimeSTT
+kokoro
