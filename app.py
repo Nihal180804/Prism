@@ -12,8 +12,6 @@ import simpleaudio as sa
 from flask import Flask, render_template, Response, request, jsonify
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
-from RealtimeSTT import AudioToTextRecorder
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(__name__)
@@ -32,15 +30,20 @@ for d in [SESSIONS_DIR, RESPONSES_DIR, DONE_DIR, EVALUATIONS_DIR, JD_DIR, RESUME
     os.makedirs(d, exist_ok=True)
 
 # ── Shared camera ────────────────────────────────────────────────────────────
-_camera      = None
-_camera_lock = threading.Lock()
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+_camera       = None
+_camera_lock  = threading.Lock()
+_camera_index = 1
+face_cascade  = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
 def get_camera():
     global _camera
     if _camera is None or not _camera.isOpened():
-        _camera = cv2.VideoCapture(0)
+        # Try DirectShow first (better USB webcam support on Windows),
+        # fall back to default backend if it fails
+        _camera = cv2.VideoCapture(_camera_index, cv2.CAP_DSHOW)
+        if not _camera.isOpened():
+            _camera = cv2.VideoCapture(_camera_index)
     return _camera
 
 
@@ -49,6 +52,26 @@ def release_camera():
     if _camera and _camera.isOpened():
         _camera.release()
         _camera = None
+
+
+@socketio.on('switch_camera')
+def on_switch_camera(data):
+    global _camera, _camera_index
+    requested = int(data.get('index', 0))
+    with _camera_lock:
+        if _camera and _camera.isOpened():
+            _camera.release()
+        _camera = cv2.VideoCapture(requested, cv2.CAP_DSHOW)
+        if not _camera.isOpened():
+            _camera = cv2.VideoCapture(requested)
+        if _camera.isOpened():
+            _camera_index = requested
+            emit('camera_switched', {'index': requested, 'ok': True})
+        else:
+            _camera = cv2.VideoCapture(_camera_index, cv2.CAP_DSHOW)
+            if not _camera.isOpened():
+                _camera = cv2.VideoCapture(_camera_index)
+            emit('camera_switched', {'index': requested, 'ok': False})
 
 
 # ── MJPEG video feed ─────────────────────────────────────────────────────────
@@ -303,6 +326,7 @@ def on_start_interview(data):
 
     if recorder is None:
         try:
+            from RealtimeSTT import AudioToTextRecorder
             recorder = AudioToTextRecorder(language="en")
         except Exception as e:
             emit('error', {'message': f'Could not start audio recorder: {e}'})

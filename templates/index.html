@@ -152,6 +152,24 @@
     }
     .cam-badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--green); display: inline-block; }
 
+    .cam-toggle {
+      position: absolute;
+      top: 10px; right: 10px;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(6px);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 5px 8px;
+      font-size: 0.75rem;
+      color: var(--muted);
+      cursor: pointer;
+      z-index: 10;
+      transition: color 0.15s, background 0.15s;
+      user-select: none;
+    }
+    .cam-toggle:hover { color: var(--text); background: rgba(0,0,0,0.75); }
+    .cam-toggle.switching { opacity: 0.45; pointer-events: none; }
+
     /* Info cards */
     .info-card {
       background: var(--surface2);
@@ -502,6 +520,7 @@
         <div class="cam-avatar-label" id="cam-avatar-label">Camera unavailable</div>
       </div>
       <div class="cam-badge" id="cam-badge">LIVE</div>
+      <div class="cam-toggle" id="cam-toggle" onclick="switchCamera()" title="Switch camera">⇄ Cam <span id="cam-index-label">0</span></div>
     </div>
 
     <!-- Candidate info (hidden until interview starts) -->
@@ -606,6 +625,7 @@
   const camFeed   = document.getElementById('cam-feed');
   const camAvatar = document.getElementById('cam-avatar');
   const camBadge  = document.getElementById('cam-badge');
+  let currentCamIndex = 0;
 
   camFeed.onload = () => {
     camFeed.style.display = 'block';
@@ -617,6 +637,26 @@
     camAvatar.style.display = 'flex';
     camBadge.style.display = 'none';
   };
+
+  function switchCamera() {
+    const toggle = document.getElementById('cam-toggle');
+    toggle.classList.add('switching');
+    const nextIndex = (currentCamIndex + 1) % 4;
+    socket.emit('switch_camera', { index: nextIndex });
+  }
+
+  socket.on('camera_switched', d => {
+    const toggle = document.getElementById('cam-toggle');
+    toggle.classList.remove('switching');
+    if (d.ok) {
+      currentCamIndex = d.index;
+      document.getElementById('cam-index-label').textContent = d.index;
+      // Reload the feed by busting the cache
+      camFeed.src = '/video_feed?t=' + Date.now();
+    } else {
+      toggle.title = `Camera ${d.index} not found`;
+    }
+  });
 
   function updateAvatar(name) {
     if (!name) return;

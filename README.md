@@ -47,7 +47,7 @@ Recruiter uploads JD + Resumes
 
 **Candidate Portal** (`/`)
 - Session ID login — no account needed
-- Live webcam feed with face-detection overlay
+- Live webcam feed with face-detection overlay and in-browser camera toggle (switch between built-in and external webcam)
 - Initials avatar fallback when camera is unavailable
 - Questions read aloud via TTS; answers captured by microphone
 - Say **"Can you repeat"** to replay any question
@@ -196,3 +196,7 @@ All configuration is handled through `.env` in the project root:
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+Built by [Nihal J](https://github.com/your-username)
