@@ -183,13 +183,41 @@ Prism/
 
 ## Configuration
 
-All configuration is handled through `.env` in the project root:
+All configuration is handled through `.env` in the project root (see `.env.example`):
 
-| Variable | Description |
-|---|---|
-| `EMAIL_SENDER` | Gmail address used to send Session IDs |
-| `EMAIL_PASSWORD` | Gmail app password (not your regular password) |
-| `MISTRAL_URL` | LM Studio API endpoint (default: `http://127.0.0.1:1234/v1/chat/completions`) |
+| Variable | Description | Default |
+|---|---|---|
+| `EMAIL_SENDER` | Gmail address used to send Session IDs | — |
+| `EMAIL_PASSWORD` | Gmail app password (not your regular password) | — |
+| `MISTRAL_URL` | LM Studio API endpoint | `http://127.0.0.1:1234/v1/chat/completions` |
+| `MISTRAL_MODEL` | Model name sent to LM Studio | `mistral-7b-instruct-v0.3` |
+| `HOST` | Interface to bind (use `0.0.0.0` to expose on the network) | `127.0.0.1` |
+| `PORT` | Server port | `5000` |
+| `SECRET_KEY` | Flask session signing key (random per start if unset) | random |
+| `CORS_ALLOWED_ORIGINS` | Allowed Socket.IO origins | `*` |
+| `RECRUITER_USER` | Username for the recruiter dashboard | `recruiter` |
+| `RECRUITER_PASSWORD` | Password for the recruiter dashboard — **if unset the dashboard is open** | — |
+| `CAMERA_INDEX` | Webcam device index (0 = built-in) | `0` |
+| `FACE_WARN_SECONDS` | Seconds with no face before a warning | `3` |
+| `FACE_EXIT_SECONDS` | Seconds with no face before ending the interview | `7` |
+
+### Security
+
+- The recruiter dashboard (`/recruiter`) and all `/api` routes are protected by HTTP
+  Basic Auth when `RECRUITER_PASSWORD` is set. Leave it unset only for local development.
+- `HOST` defaults to `127.0.0.1`, so the server is not reachable from the network
+  unless you explicitly set `HOST=0.0.0.0` — do that only with a password set.
+
+---
+
+## Testing
+
+Pure logic (question parsing, résumé field extraction, evaluation scoring) is covered
+by a `pytest` suite that needs no webcam, microphone, or running LLM:
+
+```bash
+pytest
+```
 
 ---
 

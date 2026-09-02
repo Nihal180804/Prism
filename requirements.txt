@@ -10,3 +10,6 @@ flask-socketio
 werkzeug
 RealtimeSTT
 kokoro
+
+# Dev / testing
+pytest

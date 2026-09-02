@@ -2,6 +2,7 @@ import os
 import uuid
 import smtplib
 import re
+import logging
 import fitz
 import soundfile as sf
 import shutil
@@ -13,7 +14,10 @@ import requests
 
 load_dotenv()
 
+log = logging.getLogger("prism.backend")
+
 MISTRAL_URL   = os.getenv("MISTRAL_URL", "http://127.0.0.1:1234/v1/chat/completions")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-7b-instruct-v0.3")
 VOICE         = 'af_heart'
 SESSIONS_DIR  = "Job/sessions"
 JD_PATH       = "Job/Jd"
@@ -39,7 +43,7 @@ def get_pipeline():
 def ask_mistral(prompt, system_prompt="You are a helpful assistant.", temperature=0.4, max_tokens=512):
     headers  = {"Content-Type": "application/json"}
     payload  = {
-        "model": "mistral-7b-instruct-v0.1",
+        "model": MISTRAL_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": prompt},
@@ -90,18 +94,32 @@ def build_question_prompt(resume_text, jd_text):
         "  Q5–Q6  Hard   — advanced scenarios or edge-cases that probe depth and seniority\n\n"
         "Rules:\n"
         "  • Every question must relate to both the JD requirements AND something visible in the resume.\n"
-        "  • Include at least one behavioural question (situation/task/action/result format).\n"
+        "  • Prefix EACH question with a type tag: [CODING] for questions best answered by writing "
+        "code, or [VERBAL] for conceptual, design, or behavioural questions.\n"
+        "  • Make exactly 2 of the 6 questions [CODING] (prefer the Medium/Hard ones); the rest [VERBAL].\n"
+        "  • Include at least one behavioural [VERBAL] question (situation/task/action/result format).\n"
         "  • Keep each question to 1-2 sentences — crisp and unambiguous.\n"
-        "  • Return ONLY the numbered list (1. … 2. … etc.). No headings, no commentary.\n\n"
+        "  • Return ONLY the numbered list, one per line like: 1. [VERBAL] <question>. No headings, no commentary.\n\n"
         f"JOB DESCRIPTION:\n{jd_text}\n\n"
         f"CANDIDATE RESUME:\n{resume_text}"
     )
 
 
 def parse_questions(raw_response):
-    questions = re.findall(r'^\s*\d+\.\s+(.+)', raw_response.strip(), re.MULTILINE)
-    if not questions:
-        questions = [q.strip() for q in raw_response.strip().splitlines() if q.strip()]
+    """Parse the LLM's numbered list into [{'type': 'coding'|'verbal', 'text': str}].
+    Each line may carry a leading [CODING]/[VERBAL] tag; untagged lines default to verbal.
+    """
+    lines = re.findall(r'^\s*\d+\.\s+(.+)', raw_response.strip(), re.MULTILINE)
+    if not lines:
+        lines = [q.strip() for q in raw_response.strip().splitlines() if q.strip()]
+
+    questions = []
+    for line in lines:
+        m = re.match(r'\[?(CODING|VERBAL)\]?\s*[:.\-]?\s*(.+)', line.strip(), re.I)
+        if m:
+            questions.append({'type': m.group(1).lower(), 'text': m.group(2).strip()})
+        else:
+            questions.append({'type': 'verbal', 'text': line.strip()})
     return questions
 
 
@@ -110,7 +128,8 @@ def parse_questions(raw_response):
 def generate_tts_files(questions, output_dir):
     pipeline = get_pipeline()
     for i, q in enumerate(questions, 1):
-        audio_gen = pipeline(q, voice=VOICE)
+        text = q['text'] if isinstance(q, dict) else q
+        audio_gen = pipeline(text, voice=VOICE)
         for _, _, audio in audio_gen:
             out_path = os.path.join(output_dir, f"q{i}.wav")
             sf.write(out_path, audio, 24000)
@@ -169,7 +188,7 @@ def move_processed_resume(resume_file_path, session_id):
     resume_filename = os.path.basename(resume_file_path)
     dest = os.path.join(DONE_PATH, f"{session_id}_{resume_filename}")
     shutil.move(resume_file_path, dest)
-    print(f"[+] Resume archived: {dest}")
+    log.info("Resume archived: %s", dest)
 
 
 # ── Core processing ──────────────────────────────────────────────────────────
@@ -181,7 +200,7 @@ def process_single_resume(resume_file_path, jd_text, progress_cb=None):
     Returns dict with session_id, email, candidate_name on success; raises on failure.
     """
     def cb(msg):
-        print(f"[+] {msg}")
+        log.info("%s", msg)
         if progress_cb:
             progress_cb(msg)
 
@@ -207,7 +226,7 @@ def process_single_resume(resume_file_path, jd_text, progress_cb=None):
 
     with open(os.path.join(session_path, "questions.txt"), "w", encoding="utf-8") as f:
         for q in questions:
-            f.write(q + "\n")
+            f.write(f"{q['type'].upper()}: {q['text']}\n")
 
     # Persist candidate metadata alongside questions
     with open(os.path.join(session_path, "meta.txt"), "w", encoding="utf-8") as f:
@@ -228,6 +247,8 @@ def process_single_resume(resume_file_path, jd_text, progress_cb=None):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     os.makedirs(RESUME_PATH,  exist_ok=True)
     os.makedirs(JD_PATH,      exist_ok=True)
@@ -238,7 +259,7 @@ def main():
         jd_path      = find_jd_file()
         jd_text      = extract_text_from_pdf(jd_path)
 
-        print(f"[+] {len(resume_paths)} resume(s) | JD: {jd_path}")
+        log.info("%d resume(s) | JD: %s", len(resume_paths), jd_path)
 
         ok = err = 0
         for rp in resume_paths:
@@ -246,15 +267,15 @@ def main():
                 process_single_resume(rp, jd_text)
                 ok += 1
             except Exception as e:
-                print(f"[!] Failed ({os.path.basename(rp)}): {e}")
+                log.error("Failed (%s): %s", os.path.basename(rp), e)
                 err += 1
 
-        print(f"\n[✔] Complete — {ok} succeeded, {err} failed")
+        log.info("Complete — %d succeeded, %d failed", ok, err)
 
     except FileNotFoundError as e:
-        print(f"[!] {e}")
+        log.error("%s", e)
     except Exception as e:
-        print(f"[!] Unexpected error: {e}")
+        log.error("Unexpected error: %s", e)
 
 
 if __name__ == '__main__':

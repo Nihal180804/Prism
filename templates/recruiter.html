@@ -3,30 +3,33 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Recruiter Dashboard — AI Hiring Platform</title>
+  <title>Prism — Recruiter Dashboard</title>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <style>
     :root {
-      --bg:       #0f0f13;
-      --surface:  #1a1a24;
-      --surface2: #22222f;
-      --border:   #2e2e3e;
+      --bg:       #0e0e13;
+      --surface:  #17171f;
+      --surface2: #1f1f2b;
+      --border:   #2b2b3a;
       --accent:   #6366f1;
       --accent-d: #4f46e5;
+      --accent-l: #818cf8;
       --green:    #22c55e;
       --red:      #ef4444;
       --amber:    #f59e0b;
       --blue:     #3b82f6;
       --text:     #f1f1f5;
       --muted:    #8b8b9e;
-      --r:        12px;
-      --sidebar:  240px;
+      --r:        14px;
+      --sidebar:  244px;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: var(--bg);
+      background:
+        radial-gradient(1200px 600px at 92% -10%, rgba(99,102,241,0.10), transparent 60%),
+        var(--bg);
       color: var(--text);
-      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
       height: 100vh;
       display: flex;
       overflow: hidden;
@@ -35,7 +38,8 @@
     /* ── Sidebar ── */
     aside {
       width: var(--sidebar);
-      background: var(--surface);
+      background: rgba(23,23,31,0.7);
+      backdrop-filter: blur(10px);
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
@@ -45,13 +49,20 @@
     .logo {
       display: flex;
       align-items: center;
-      gap: 10px;
-      padding: 20px 20px 24px;
+      gap: 11px;
+      padding: 18px 20px 20px;
       font-weight: 700;
-      font-size: 1rem;
+      font-size: 1.02rem;
+      letter-spacing: 0.2px;
       border-bottom: 1px solid var(--border);
     }
-    .logo-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+    .logo-mark {
+      width: 28px; height: 28px; border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-l));
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.95rem; box-shadow: 0 4px 14px rgba(99,102,241,0.4); flex-shrink: 0;
+    }
+    .logo small { display: block; color: var(--muted); font-weight: 500; font-size: 0.7rem; margin-top: 1px; }
     nav { flex: 1; padding: 16px 12px; display: flex; flex-direction: column; gap: 4px; }
     .nav-item {
       display: flex;
@@ -66,7 +77,7 @@
       user-select: none;
     }
     .nav-item:hover   { background: var(--surface2); color: var(--text); }
-    .nav-item.active  { background: rgba(99,102,241,0.15); color: var(--accent); font-weight: 600; }
+    .nav-item.active  { background: rgba(99,102,241,0.15); color: var(--accent-l); font-weight: 600; }
     .nav-icon { font-size: 1rem; width: 20px; text-align: center; }
     .sidebar-bottom {
       padding: 12px;
@@ -97,6 +108,8 @@
       justify-content: space-between;
       padding: 0 28px;
       flex-shrink: 0;
+      background: rgba(23,23,31,0.5);
+      backdrop-filter: blur(10px);
     }
     .topbar h1 { font-size: 1.05rem; font-weight: 600; }
     .topbar-actions { display: flex; gap: 10px; }
@@ -111,8 +124,8 @@
       transition: opacity 0.15s, transform 0.1s;
     }
     .btn:active { transform: scale(0.97); }
-    .btn-primary { background: var(--accent);  color: #fff; }
-    .btn-primary:hover { background: var(--accent-d); }
+    .btn-primary { background: linear-gradient(135deg, var(--accent), var(--accent-d)); color: #fff; box-shadow: 0 6px 16px rgba(99,102,241,0.28); }
+    .btn-primary:hover { filter: brightness(1.08); }
     .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
     .btn-outline:hover { background: var(--surface2); }
     .btn-green  { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
@@ -137,11 +150,13 @@
       border: 1px solid var(--border);
       border-radius: var(--r);
       padding: 20px 22px;
+      transition: border-color 0.15s, transform 0.15s;
     }
+    .stat-card:hover { border-color: rgba(99,102,241,0.4); transform: translateY(-2px); }
     .stat-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 8px; }
     .stat-value { font-size: 2rem; font-weight: 700; }
     .stat-sub   { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
-    .stat-card.accent .stat-value { color: var(--accent); }
+    .stat-card.accent .stat-value { color: var(--accent-l); }
     .stat-card.green  .stat-value { color: var(--green); }
     .stat-card.amber  .stat-value { color: var(--amber); }
     .stat-card.blue   .stat-value { color: var(--blue); }
@@ -377,7 +392,7 @@
     .empty .empty-icon { font-size: 2.5rem; margin-bottom: 12px; }
 
     /* Scrollbar */
-    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   </style>
@@ -387,8 +402,8 @@
 <!-- Sidebar -->
 <aside>
   <div class="logo">
-    <div class="logo-dot"></div>
-    AI Hiring Platform
+    <div class="logo-mark">◆</div>
+    <div>Prism<small>Recruiter</small></div>
   </div>
   <nav>
     <div class="nav-item active" data-view="dashboard">
