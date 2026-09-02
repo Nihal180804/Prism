@@ -48,6 +48,20 @@ class Settings:
     # ── Dev ─────────────────────────────────────────────────────────────────────
     dev_mode: bool = _get_bool("PRISM_DEV", False)             # enables the practice-session helper
 
+    # ── Interview rules ──────────────────────────────────────────────────────────
+    # Shown as a pre-interview agreement gate the candidate must accept before
+    # starting. Edit this list freely — order is preserved and each item renders
+    # as one numbered rule.
+    interview_rules: tuple = (
+        "This is an individual assessment. Do not get help from other people, and do not use AI assistants, search engines, or other outside resources unless a question explicitly allows it.",
+        "Stay in view of your camera for the whole interview. Leaving the frame, or another person appearing, may be flagged.",
+        "Do not switch to other tabs, windows, or applications while the interview is running.",
+        "Answer every question yourself — in your own words, and your own code.",
+        "You get one submission per question. Once you submit an answer you cannot change it.",
+        "Your answers and your camera presence are recorded and shared with the recruiter for evaluation.",
+        "If you lose connection, rejoin with the same Session ID as soon as you can.",
+    )
+
     # ── Data directories ────────────────────────────────────────────────────────
     sessions_dir: str = "Job/sessions"
     responses_dir: str = "Job/responses"

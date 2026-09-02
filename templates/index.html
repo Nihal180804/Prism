@@ -134,6 +134,26 @@
     .dev-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
     .dev-btn:disabled { opacity: 0.6; cursor: default; }
 
+    /* ── Rules agreement gate ── */
+    #rules-screen { flex: 1; display: none; align-items: center; justify-content: center; padding: 24px; }
+    .rules-card { width: 540px; max-width: 100%; }
+    .rules-list {
+      margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 11px;
+      color: var(--text); font-size: 0.88rem; line-height: 1.5;
+      max-height: 320px; overflow-y: auto;
+    }
+    .rules-list li { padding-left: 4px; }
+    .rules-list li::marker { color: var(--accent-l); font-weight: 700; }
+    .agree-row {
+      display: flex; align-items: flex-start; gap: 10px; font-size: 0.86rem; color: var(--text);
+      cursor: pointer; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 14px;
+    }
+    .agree-row input { margin-top: 1px; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+    #rules-error { color: var(--red); font-size: 0.82rem; text-align: center; min-height: 16px; }
+    .link-back { background: none; border: none; color: var(--muted); font-size: 0.82rem; cursor: pointer; }
+    .link-back:hover { color: var(--text); }
+
     /* ── Interview: split layout ── */
     #interview-screen { flex: 1; display: none; overflow: hidden; }
     .split { flex: 1; display: grid; grid-template-columns: 1fr 1fr; overflow: hidden; }
@@ -326,10 +346,34 @@
       <div class="hint">You should have received a Session ID by email. The interview mixes written technical questions with live coding tasks and takes about 15–20 minutes.</div>
 
       <div id="error-msg"></div>
-      <button class="btn-primary" id="start-btn">Begin Interview →</button>
+      <button class="btn-primary" id="continue-btn">Continue →</button>
       {% if dev_mode %}
       <button class="dev-btn" id="practice-btn" onclick="startPractice()">🧪 Start a practice session (dev)</button>
       {% endif %}
+    </div>
+  </div>
+
+  <!-- Rules agreement -->
+  <div id="rules-screen">
+    <div class="login-card rules-card">
+      <div class="login-badge">Before you begin</div>
+      <div class="login-title">Interview rules</div>
+      <div class="login-sub">Please read these carefully — you'll need to agree before your interview starts.</div>
+
+      <ol class="rules-list">
+        {% for rule in rules %}
+        <li>{{ rule }}</li>
+        {% endfor %}
+      </ol>
+
+      <label class="agree-row">
+        <input type="checkbox" id="agree-check"/>
+        <span>I have read and agree to the interview rules above.</span>
+      </label>
+
+      <div id="rules-error"></div>
+      <button class="btn-primary" id="start-btn" disabled>Begin Interview →</button>
+      <button class="link-back" id="back-btn" onclick="showScreen('login')">← Back</button>
     </div>
   </div>
 
@@ -657,23 +701,44 @@
   }
   function showScreen(name) {
     document.getElementById('login-screen').style.display     = name==='login'     ? 'flex' : 'none';
+    document.getElementById('rules-screen').style.display     = name==='rules'     ? 'flex' : 'none';
     document.getElementById('interview-screen').style.display = name==='interview' ? 'flex' : 'none';
     document.getElementById('results-screen').style.display   = name==='results'   ? 'flex' : 'none';
     document.getElementById('exit-btn').style.display         = name==='interview' ? 'block': 'none';
     if (name === 'interview') { initEditor(document.getElementById('lang-select').value); }
   }
 
-  // ── Login ──────────────────────────────────────────────────────────────────
-  document.getElementById('start-btn').addEventListener('click', startInterview);
-  ['sid-input','name-input'].forEach(id => document.getElementById(id).addEventListener('keydown', e => { if (e.key==='Enter') startInterview(); }));
-  function startInterview() {
+  // ── Login → rules → start ────────────────────────────────────────────────────
+  // Login validates the fields then shows the rules screen (no server call yet).
+  document.getElementById('continue-btn').addEventListener('click', goToRules);
+  ['sid-input','name-input'].forEach(id => document.getElementById(id).addEventListener('keydown', e => { if (e.key==='Enter') goToRules(); }));
+  function goToRules() {
     const sid=document.getElementById('sid-input').value.trim();
     const name=document.getElementById('name-input').value.trim();
     const err=document.getElementById('error-msg');
     if (!sid || !name) { err.textContent='Both fields are required.'; return; }
     err.textContent='';
+    // Require a fresh agreement each time the candidate reaches the rules.
+    const chk=document.getElementById('agree-check'); chk.checked=false;
+    document.getElementById('start-btn').disabled=true;
+    document.getElementById('rules-error').textContent='';
+    showScreen('rules');
+  }
+
+  // Rules screen: Begin unlocks only once the box is ticked.
+  document.getElementById('agree-check').addEventListener('change', e => {
+    document.getElementById('start-btn').disabled = !e.target.checked;
+  });
+  document.getElementById('start-btn').addEventListener('click', startInterview);
+  function startInterview() {
+    if (!document.getElementById('agree-check').checked) {
+      document.getElementById('rules-error').textContent='Please agree to the rules to continue.';
+      return;
+    }
+    const sid=document.getElementById('sid-input').value.trim();
+    const name=document.getElementById('name-input').value.trim();
     const btn=document.getElementById('start-btn'); btn.disabled=true; btn.textContent='Connecting…';
-    socket.emit('start_interview', { session_id: sid, candidate_name: name });
+    socket.emit('start_interview', { session_id: sid, candidate_name: name, agreed: true });
   }
 
   // Dev helper: create a ready-to-run coding+verbal session and start it.
@@ -686,7 +751,8 @@
       if (!r.ok) throw new Error(d.error || 'failed');
       document.getElementById('sid-input').value  = d.session_id;
       document.getElementById('name-input').value = 'Practice Candidate';
-      startInterview();
+      // Dev practice skips the rules gate — send the agreement flag directly.
+      socket.emit('start_interview', { session_id: d.session_id, candidate_name: 'Practice Candidate', agreed: true });
     } catch (e) {
       document.getElementById('error-msg').textContent = 'Practice session failed: ' + e.message;
       btn.disabled = false; btn.textContent = '🧪 Start a practice session (dev)';
@@ -696,7 +762,11 @@
   // ── Socket events ──────────────────────────────────────────────────────────
   socket.on('connect',    () => setNavBadge('Connected'));
   socket.on('disconnect', () => setNavBadge('Disconnected'));
-  socket.on('error', d => { document.getElementById('error-msg').textContent=d.message; const b=document.getElementById('start-btn'); b.disabled=false; b.textContent='Begin Interview →'; });
+  socket.on('error', d => {
+    showScreen('login');                       // route the message back to the login card
+    document.getElementById('error-msg').textContent=d.message;
+    const b=document.getElementById('start-btn'); b.disabled=true; b.textContent='Begin Interview →';
+  });
 
   socket.on('interview_started', d => {
     updateAvatar(d.candidate);
@@ -737,7 +807,11 @@
     });
     showScreen('results');
   });
-  socket.on('force_exit', () => { setNavBadge('Session ended'); showScreen('login'); const b=document.getElementById('start-btn'); b.disabled=false; b.textContent='Begin Interview →'; });
+  socket.on('force_exit', () => {
+    setNavBadge('Session ended'); showScreen('login');
+    const b=document.getElementById('start-btn'); b.disabled=true; b.textContent='Begin Interview →';
+    document.getElementById('agree-check').checked=false;
+  });
 
   function exitInterview() { if (confirm('End the interview early?')) socket.emit('exit_interview'); }
   function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }

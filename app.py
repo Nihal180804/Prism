@@ -297,7 +297,8 @@ def _finish_interview(session: InterviewSession):
             f.write(f"Session ID: {session.session_id}\n")
             f.write(f"Candidate Name: {session.candidate_name}\n")
             f.write(f"Date: {now.strftime('%Y-%m-%d')}\n")
-            f.write(f"Time: {now.strftime('%H:%M:%S')}\n\n")
+            f.write(f"Time: {now.strftime('%H:%M:%S')}\n")
+            f.write(f"Agreed to interview rules: yes ({session.agreed_at or 'unknown'})\n\n")
             # zip_longest (not zip) so an interview that ended early still
             # records every question — unanswered ones get an explicit marker
             # instead of being silently dropped.
@@ -350,6 +351,13 @@ def on_start_interview(data):
         emit('error', {'message': 'Session ID and name are required.'})
         return
 
+    # The candidate must accept the interview rules before starting. The gate is
+    # enforced in the UI; this is the server-side backstop so a session can't be
+    # started without it.
+    if not data.get('agreed'):
+        emit('error', {'message': 'You must agree to the interview rules to begin.'})
+        return
+
     # Reject anything that isn't a bare identifier — blocks path traversal
     # (e.g. "../../..") through the session_id into arbitrary folders.
     if session_id != secure_filename(session_id) or not re.fullmatch(r'[A-Za-z0-9_-]+', session_id):
@@ -370,6 +378,7 @@ def on_start_interview(data):
         return
 
     meta = session.load_meta()
+    session.agreed_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     emit('interview_started', {
         'total_questions': len(session.questions),
@@ -737,7 +746,7 @@ def api_dev_practice_session():
 
 @app.route('/')
 def index():
-    return render_template('index.html', dev_mode=DEV_MODE)
+    return render_template('index.html', dev_mode=DEV_MODE, rules=settings.interview_rules)
 
 
 @app.route('/recruiter')

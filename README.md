@@ -21,6 +21,9 @@ Recruiter uploads JD + Resumes
   Candidate opens localhost:5000, enters Session ID
          │
          ▼
+  Reviews and agrees to the interview rules
+         │
+         ▼
   Written interview — questions shown on screen; verbal answers typed, coding answers written in a live editor
   Face monitor runs in parallel (warns/exits if candidate leaves frame)
          │
@@ -44,6 +47,7 @@ Recruiter uploads JD + Resumes
 
 **Candidate Portal** (`/`)
 - Session ID login — no account needed
+- Rules-agreement gate — the candidate must accept the interview rules before starting; acceptance is recorded with their responses (rules are editable in `prism/config.py`)
 - Live webcam feed with face-detection overlay and in-browser camera toggle (switch between built-in and external webcam)
 - Initials avatar fallback when camera is unavailable
 - Questions shown on screen; verbal answers typed, coding answers written in a live CodeMirror editor with AI review

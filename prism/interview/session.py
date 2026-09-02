@@ -30,6 +30,7 @@ class InterviewSession:
         self.responses      = []
         self.current_q      = 0
         self.stopping       = False
+        self.agreed_at      = None   # timestamp the candidate accepted the rules
         self.session_folder = os.path.join(sessions_dir, session_id)
         # Answer handoff between the socket handler and the interview loop.
         # Used for BOTH typed verbal answers and submitted code — every
