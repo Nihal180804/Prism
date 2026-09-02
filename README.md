@@ -2,7 +2,7 @@
 
 > See every candidate clearly.
 
-Prism is a fully local, end-to-end automated hiring platform. It reads resumes, generates personalised interview questions using a local LLM, conducts voice interviews with real-time speech recognition, monitors candidate presence via webcam, and produces detailed scored evaluation reports — all from a clean web interface.
+Prism is a fully local, end-to-end automated hiring platform. It reads resumes, generates personalised interview questions using a local LLM, conducts written technical interviews with a live coding workspace, monitors candidate presence via webcam, and produces detailed scored evaluation reports — all from a clean web interface.
 
 ---
 
@@ -15,16 +15,13 @@ Recruiter uploads JD + Resumes
   Mistral 7B generates 6 personalised questions (Easy → Medium → Hard)
          │
          ▼
-  Kokoro TTS synthesises question audio
-         │
-         ▼
   Session ID emailed to candidate
          │
          ▼
   Candidate opens localhost:5000, enters Session ID
          │
          ▼
-  Voice interview — questions played aloud, answers captured via STT
+  Written interview — questions shown on screen; verbal answers typed, coding answers written in a live editor
   Face monitor runs in parallel (warns/exits if candidate leaves frame)
          │
          ▼
@@ -49,8 +46,7 @@ Recruiter uploads JD + Resumes
 - Session ID login — no account needed
 - Live webcam feed with face-detection overlay and in-browser camera toggle (switch between built-in and external webcam)
 - Initials avatar fallback when camera is unavailable
-- Questions read aloud via TTS; answers captured by microphone
-- Say **"Can you repeat"** to replay any question
+- Questions shown on screen; verbal answers typed, coding answers written in a live CodeMirror editor with AI review
 - Difficulty badge per question (Easy / Medium / Hard)
 - Full Q&A summary shown on completion
 
@@ -62,10 +58,8 @@ Recruiter uploads JD + Resumes
 |---|---|
 | Backend | Python, Flask, Flask-SocketIO |
 | LLM | Mistral 7B Instruct (via LM Studio) |
-| TTS | Kokoro-82M (`hexgrad/Kokoro-82M`) |
-| STT | RealtimeSTT |
 | Vision | OpenCV (Haar cascade face detection) |
-| Frontend | Vanilla HTML/CSS/JS (no framework) |
+| Frontend | Vanilla HTML/CSS/JS + CodeMirror (no framework) |
 | Email | Gmail SMTP with app password |
 
 ---
@@ -79,7 +73,6 @@ Recruiter uploads JD + Resumes
 | Storage | 12 GB free | 20 GB free |
 | Python | 3.9 | 3.10 / 3.11 |
 | OS | Windows 10/11 | Windows 11 |
-| Microphone | Required | USB / headset mic |
 | Webcam | Optional | 720p+ |
 
 ---
@@ -147,8 +140,8 @@ Open your browser:
 1. Check your email for your Session ID
 2. Go to `http://localhost:5000`
 3. Enter your Session ID and full name
-4. Allow microphone and camera access when prompted
-5. Answer each question aloud — say *"Can you repeat"* to replay a question
+4. Allow camera access when prompted (optional — used for presence monitoring)
+5. Answer each question in the workspace — type verbal answers, write code for coding questions — then click **Submit Answer**
 6. Your responses are saved automatically when the interview ends
 
 ---
@@ -164,11 +157,7 @@ Prism/
 ├── README.md
 ├── .gitignore
 ├── .env.example          ← copy to .env and fill in your credentials
-├── speech/
-│   ├── intro.wav
-│   ├── warning1.wav
-│   ├── warning2.wav
-│   └── Exiting.wav
+├── prism/                ← refactored package (config, interview session/registry)
 └── templates/
     ├── index.html        ← candidate portal
     └── recruiter.html    ← recruiter dashboard

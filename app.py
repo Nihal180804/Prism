@@ -13,7 +13,6 @@ from itertools import zip_longest
 from functools import wraps
 
 import cv2
-import simpleaudio as sa
 from flask import Flask, render_template, Response, request, jsonify
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
@@ -166,9 +165,6 @@ def video_feed():
 
 # ── Interview session ────────────────────────────────────────────────────────
 # InterviewSession and SessionRegistry now live in prism/interview/session.py.
-# The process-wide STT recorder remains a singleton (server-side capture);
-# browser-side capture (roadmap P0) is what will finally make it per-session.
-recorder = None
 
 
 # ── Face monitor ─────────────────────────────────────────────────────────────
@@ -224,22 +220,11 @@ def face_monitor_web(session: InterviewSession):
 
 
 # ── Interview flow ────────────────────────────────────────────────────────────
-
-def play_wav(path):
-    try:
-        wo = sa.WaveObject.from_wave_file(path)
-        wo.play().wait_done()
-    except Exception as e:
-        log.warning("Audio playback failed for %s: %s", path, e)
-
+# The interview is fully text-based: questions are shown on screen (no TTS) and
+# every answer — typed prose for verbal questions, editor contents for coding
+# ones — arrives via the `submit_answer` socket event. There is no audio or STT.
 
 def run_interview(session: InterviewSession):
-    # Play the intro greeting in the background — never block the first question
-    # on audio playback (a hung/slow audio device would strand the interview).
-    intro = "speech/intro.wav"
-    if os.path.exists(intro):
-        threading.Thread(target=play_wav, args=(intro,), daemon=True).start()
-
     total = len(session.questions)
     for i, q in enumerate(session.questions):
         if session.stopping:
@@ -258,17 +243,10 @@ def run_interview(session: InterviewSession):
             'progress': progress,
         })
 
-        wav_path = os.path.join(session.session_folder, f"q{q_num}.wav")
-        if os.path.exists(wav_path):
-            play_wav(wav_path)
-
         if session.stopping:
             break
 
-        if qtype == 'coding':
-            answer = _await_code_answer(session)
-        else:
-            answer = _await_voice_answer(session, wav_path)
+        answer = _await_answer(session, qtype)
 
         if session.stopping:
             break
@@ -281,64 +259,26 @@ def run_interview(session: InterviewSession):
         _finish_interview(session)
 
 
-def _await_voice_answer(session: InterviewSession, wav_path):
-    """Capture a spoken answer. Starts the STT recorder lazily so coding-only
-    stretches (and the initial connect) don't require a working microphone."""
-    global recorder
+def _await_answer(session: InterviewSession, qtype: str):
+    """Block the interview thread until the candidate submits an answer.
 
-    if recorder is None:
-        try:
-            from RealtimeSTT import AudioToTextRecorder
-            recorder = AudioToTextRecorder(language="en")
-        except Exception as e:
-            log.warning("STT recorder unavailable: %s", e)
-            session.emit('warning', {'level': 'warn', 'message': 'Microphone/transcription unavailable — voice answer skipped.'})
-            return "[Audio unavailable]"
+    Both question kinds are answered the same way — via `submit_answer` — so
+    this one waiter serves coding (editor contents) and verbal (typed prose).
+    The only difference is the status hint the candidate sees while answering.
+    """
+    session.pending_answer  = None
+    session.answer_event.clear()
+    session.emit('status', {'state': 'coding' if qtype == 'coding' else 'answering'})
+    session.awaiting_answer = True   # accept a submission only once the event is cleared
 
-    session.emit('status', {'state': 'listening'})
-    try:
-        answer = recorder.text() or ""
-    except Exception as e:
-        answer = ""
-        log.warning("STT error: %s", e)
-
-    if session.stopping:
-        return answer or "[No response detected]"
-
-    if not answer.strip():
-        answer = "[No response detected]"
-
-    # Treat as a repeat request only when that phrase is essentially the
-    # whole utterance — not when it appears inside a longer real answer.
-    normalized = re.sub(r'[^a-z ]', '', answer.strip().lower()).strip()
-    if normalized in ('can you repeat', 'can you repeat that', 'repeat', 'repeat the question', 'can you repeat the question'):
-        session.emit('chat_message', {'sender': '🔁 System', 'message': 'Repeating the question…'})
-        if os.path.exists(wav_path):
-            play_wav(wav_path)
-        session.emit('status', {'state': 'listening'})
-        try:
-            answer = recorder.text() or "[No response detected]"
-        except Exception:
-            answer = "[No response detected]"
-
-    return answer
-
-
-def _await_code_answer(session: InterviewSession):
-    """Wait for the candidate to submit code as their answer to a coding question."""
-    session.pending_code  = None
-    session.code_event.clear()
-    session.emit('status', {'state': 'coding'})
-    session.awaiting_code = True   # accept a submission only once the event is cleared
-
-    while not session.code_event.wait(timeout=1):
+    while not session.answer_event.wait(timeout=1):
         if session.stopping:
-            session.awaiting_code = False
-            return "[No code submitted]"
+            session.awaiting_answer = False
+            return "[No answer submitted]"
 
-    session.awaiting_code = False
-    code = (session.pending_code or "").strip()
-    return code if code else "[No code submitted]"
+    session.awaiting_answer = False
+    answer = (session.pending_answer or "").strip()
+    return answer if answer else "[No answer submitted]"
 
 
 def _finish_interview(session: InterviewSession):
@@ -431,9 +371,6 @@ def on_start_interview(data):
 
     meta = session.load_meta()
 
-    # The STT recorder is started lazily on the first verbal question
-    # (see _await_voice_answer), so coding-only stretches don't need a mic.
-
     emit('interview_started', {
         'total_questions': len(session.questions),
         'candidate':       candidate_name,
@@ -449,9 +386,6 @@ def on_exit_interview():
     session = registry.remove(request.sid)
     if session:
         session.stopping = True
-    exiting_wav = "speech/Exiting.wav"
-    if os.path.exists(exiting_wav):
-        threading.Thread(target=play_wav, args=(exiting_wav,), daemon=True).start()
     emit('force_exit', {})
 
 
@@ -495,15 +429,19 @@ def on_submit_code(data):
 
 @socketio.on('submit_answer')
 def on_submit_answer(data):
-    # Deliver the candidate's code as the answer to the current coding question,
-    # unblocking the interview loop waiting in _await_code_answer.
+    # Deliver the candidate's answer (typed prose for a verbal question, or
+    # editor contents for a coding one) to the current question, unblocking the
+    # interview loop waiting in _await_answer.
     s = registry.get(request.sid)
-    log.info("submit_answer received: session=%s awaiting_code=%s",
-             bool(s), getattr(s, 'awaiting_code', None))
-    if s and getattr(s, 'awaiting_code', False):
-        s.pending_code  = data.get('code') or ''
-        s.awaiting_code = False
-        s.code_event.set()
+    answer = data.get('answer')
+    if answer is None:                      # tolerate older clients that sent {code: ...}
+        answer = data.get('code') or ''
+    log.info("submit_answer received: session=%s awaiting=%s",
+             bool(s), getattr(s, 'awaiting_answer', None))
+    if s and getattr(s, 'awaiting_answer', False):
+        s.pending_answer  = answer
+        s.awaiting_answer = False
+        s.answer_event.set()
         log.info("submit_answer accepted — advancing interview")
 
 

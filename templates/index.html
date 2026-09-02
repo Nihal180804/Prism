@@ -197,19 +197,8 @@
     /* Status bar */
     #status-bar { margin: 12px 18px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
     #status-icon { width: 36px; height: 36px; border-radius: 50%; background: var(--surface2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 0.95rem; flex-shrink: 0; }
-    #status-icon.listening { background: rgba(99,102,241,0.12); border-color: var(--accent); animation: pulse-ring 1.3s ease infinite; }
-    @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(99,102,241,0.5);} 70%{box-shadow:0 0 0 10px rgba(99,102,241,0);} 100%{box-shadow:0 0 0 0 rgba(99,102,241,0);} }
     #status-text { font-size: 0.84rem; color: var(--muted); }
     #status-text strong { color: var(--text); }
-    .waveform { display: none; align-items: center; gap: 3px; height: 20px; margin-top: 4px; }
-    .waveform.active { display: flex; }
-    .wave-bar { width: 3px; border-radius: 2px; background: var(--accent-l); animation: wave 1s ease-in-out infinite; }
-    .wave-bar:nth-child(1){ height:8px;  animation-delay:0s; }
-    .wave-bar:nth-child(2){ height:14px; animation-delay:.1s; }
-    .wave-bar:nth-child(3){ height:20px; animation-delay:.2s; }
-    .wave-bar:nth-child(4){ height:14px; animation-delay:.3s; }
-    .wave-bar:nth-child(5){ height:8px;  animation-delay:.4s; }
-    @keyframes wave { 0%,100%{transform:scaleY(1);} 50%{transform:scaleY(0.4);} }
 
     /* Chat */
     #chat-area { flex: 1; overflow-y: auto; padding: 4px 18px 90px; display: flex; flex-direction: column; gap: 10px; position: relative; }
@@ -246,13 +235,14 @@
     .btn-submit:hover:not(:disabled) { filter: brightness(1.08); }
     .btn-submit:disabled { opacity: 0.6; cursor: default; }
     .editor-wrap { flex: 1; min-height: 0; overflow: hidden; position: relative; }
-    .code-overlay {
-      position: absolute; inset: 0; z-index: 6;
-      display: none; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
-      background: rgba(18,18,18,0.82); backdrop-filter: blur(2px);
-      color: var(--muted); font-size: 0.9rem; text-align: center;
+    /* Typed-answer box shown for verbal questions (the code editor is hidden then) */
+    .answer-box { position: absolute; inset: 0; z-index: 6; display: none; flex-direction: column; background: var(--surface); }
+    #answer-input {
+      flex: 1; width: 100%; height: 100%; resize: none; border: none; outline: none;
+      background: transparent; color: var(--text); padding: 16px 18px;
+      font-family: inherit; font-size: 0.95rem; line-height: 1.6;
     }
-    .code-overlay .co-ic { font-size: 2rem; }
+    #answer-input::placeholder { color: var(--muted); }
     .CodeMirror { height: 100% !important; font-size: 13.5px; font-family: 'JetBrains Mono','Fira Code',Consolas,monospace; line-height: 1.6; }
     .CodeMirror-gutters { border-right: 1px solid var(--border); background: #1c1c1c; }
 
@@ -322,7 +312,7 @@
     <div class="login-card">
       <div class="login-badge">AI Interview</div>
       <div class="login-title">Welcome to Prism</div>
-      <div class="login-sub">Enter your session ID to begin your AI-powered technical interview — voice questions and live coding.</div>
+      <div class="login-sub">Enter your session ID to begin your AI-powered technical interview — resume-based questions and live coding.</div>
 
       <div class="field">
         <label>Session ID</label>
@@ -333,7 +323,7 @@
         <input id="name-input" type="text" placeholder="e.g. Jane Smith" autocomplete="off"/>
       </div>
 
-      <div class="hint">You should have received a Session ID by email. The interview mixes spoken questions with live coding tasks and takes about 15–20 minutes.</div>
+      <div class="hint">You should have received a Session ID by email. The interview mixes written technical questions with live coding tasks and takes about 15–20 minutes.</div>
 
       <div id="error-msg"></div>
       <button class="btn-primary" id="start-btn">Begin Interview →</button>
@@ -365,16 +355,13 @@
             <span id="diff-badge"></span>
           </div>
           <div id="question-text">Preparing your session…</div>
-          <div id="question-tip">Say “Can you repeat” to hear a question again.</div>
+          <div id="question-tip">Answer in the workspace on the right, then click <strong>Submit Answer</strong>.</div>
         </div>
 
         <div id="status-bar">
-          <div id="status-icon">🎙</div>
+          <div id="status-icon">💬</div>
           <div>
             <span id="status-text">Waiting…</span>
-            <div class="waveform" id="waveform">
-              <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
-            </div>
           </div>
         </div>
 
@@ -411,13 +398,12 @@
 
         <div class="editor-wrap">
           <textarea id="code-editor"></textarea>
-          <div class="code-overlay" id="code-overlay">
-            <div class="co-ic">🎙</div>
-            <div>Verbal question — answer aloud.<br>The editor unlocks for coding questions.</div>
+          <div class="answer-box" id="answer-box">
+            <textarea id="answer-input" placeholder="Type your answer here. Be specific — explain your reasoning, name the concrete tools and decisions involved, and give examples where you can."></textarea>
           </div>
         </div>
 
-        <div class="review-panel">
+        <div class="review-panel" id="review-panel">
           <div class="review-head">
             <div class="rt">✨ Live AI Review</div>
             <div class="review-live" id="review-live">idle</div>
@@ -511,36 +497,63 @@
     socket.emit('submit_code', { code, language: document.getElementById('lang-select').value });
   }
 
-  // Submit code as the ANSWER to a coding question (advances the interview).
+  // Submit the ANSWER to the current question (advances the interview):
+  // editor contents for a coding question, typed prose for a verbal one.
   function submitAnswer() {
     const btn = document.getElementById('submit-answer-btn');
     if (btn.disabled) return;   // guard against a double click submitting twice
-    const code = editor ? editor.getValue() : '';
-    socket.emit('submit_answer', { code, language: document.getElementById('lang-select').value });
+    const coding = (currentType === 'coding');
+    const answer = coding
+      ? (editor ? editor.getValue() : '')
+      : document.getElementById('answer-input').value;
+    if (!coding && !answer.trim()) {           // verbal answers must have some text
+      document.getElementById('answer-input').focus();
+      return;
+    }
+    socket.emit('submit_answer', { answer, language: document.getElementById('lang-select').value });
     // Stay locked until the NEXT question re-enables it (setQuestionType),
     // so one click can never advance two questions.
     btn.disabled = true; btn.textContent = 'Submitted ✓';
   }
 
-  // Switch the workspace between a coding question (editable) and a verbal one
-  // (locked, answered by voice).
+  // Switch the workspace between a coding question (code editor + live review)
+  // and a verbal one (a plain typed-answer box).
+  let currentType = 'verbal';
   function setQuestionType(type) {
     const coding = (type === 'coding');
+    currentType = coding ? 'coding' : 'verbal';
     document.getElementById('type-badge').textContent = coding ? 'Coding' : 'Verbal';
+
+    // Submit Answer is available for BOTH kinds now (verbal answers are typed).
     const sb = document.getElementById('submit-answer-btn');
-    sb.style.display = coding ? 'flex' : 'none';
+    sb.style.display = 'flex';
     sb.disabled = false;                       // always ready for the new question
     sb.textContent = '✓ Submit Answer';
+
+    // Run & Review and the live-review panel are coding-only.
     document.getElementById('run-btn').style.display = coding ? 'flex' : 'none';
-    document.getElementById('code-overlay').style.display = coding ? 'none' : 'flex';
-    if (editor) editor.setOption('readOnly', !coding);
+    document.getElementById('review-panel').style.display = coding ? 'flex' : 'none';
+
+    // Swap the workspace body: code editor for coding, typed-answer box for verbal.
+    const cmWrap = editor ? editor.getWrapperElement() : null;
+    const answerBox = document.getElementById('answer-box');
     if (coding) {
+      if (cmWrap) cmWrap.style.display = '';
+      answerBox.style.display = 'none';
       if (editor) {                            // fresh editor for each coding question
+        editor.setOption('readOnly', false);
         suppressReview = true;
         editor.setValue(STARTERS[document.getElementById('lang-select').value] || '');
         suppressReview = false;
+        setTimeout(() => editor.refresh(), 0); // re-layout after being hidden
       }
       resetReview();
+    } else {
+      if (cmWrap) cmWrap.style.display = 'none';
+      answerBox.style.display = 'flex';
+      const ai = document.getElementById('answer-input');
+      ai.value = '';
+      ai.focus();
     }
   }
 
@@ -627,11 +640,11 @@
     return '<span class="diff-pill diff-hard">Hard</span>';
   }
   function setStatus(state) {
-    const icon=document.getElementById('status-icon'), text=document.getElementById('status-text'), wf=document.getElementById('waveform');
-    if (state === 'listening') { icon.textContent='🎙'; icon.className='listening'; text.innerHTML='<strong>Listening…</strong> speak your answer'; wf.classList.add('active'); }
-    else if (state === 'coding') { icon.textContent='⌨'; icon.className=''; text.innerHTML='<strong>Your turn to code</strong> — write your solution, then Submit Answer'; wf.classList.remove('active'); }
-    else if (state === 'saving') { icon.textContent='💾'; icon.className=''; text.textContent='Saving your responses…'; wf.classList.remove('active'); }
-    else { icon.textContent='⏳'; icon.className=''; text.textContent='Processing…'; wf.classList.remove('active'); }
+    const icon=document.getElementById('status-icon'), text=document.getElementById('status-text');
+    if (state === 'answering') { icon.textContent='✍'; icon.className=''; text.innerHTML='<strong>Your turn</strong> — type your answer, then Submit Answer'; }
+    else if (state === 'coding') { icon.textContent='⌨'; icon.className=''; text.innerHTML='<strong>Your turn to code</strong> — write your solution, then Submit Answer'; }
+    else if (state === 'saving') { icon.textContent='💾'; icon.className=''; text.textContent='Saving your responses…'; }
+    else { icon.textContent='⏳'; icon.className=''; text.textContent='Processing…'; }
   }
   function addMsg(sender, message) {
     const area=document.getElementById('chat-area');

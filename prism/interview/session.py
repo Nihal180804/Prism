@@ -4,9 +4,10 @@
 in ``app.py``. Keying sessions by websocket ``sid`` lets multiple candidates
 interview concurrently and removes the single-session bottleneck (roadmap P0).
 
-Note: the shared camera and STT recorder in ``app.py`` are still process-wide
-singletons — genuine multi-candidate concurrency also needs browser-side
-capture (the larger P0 rework). The registry unblocks the session side of it.
+Note: the shared camera in ``app.py`` is still a process-wide singleton —
+genuine multi-candidate concurrency also needs browser-side camera capture
+(the remaining half of the P0 rework). The registry unblocks the session
+side of it; the interview itself is now fully text-based (no audio/STT).
 """
 import os
 import re
@@ -30,10 +31,13 @@ class InterviewSession:
         self.current_q      = 0
         self.stopping       = False
         self.session_folder = os.path.join(sessions_dir, session_id)
-        # Coding-answer handoff between the socket handler and the interview loop
-        self.pending_code   = None
-        self.awaiting_code  = False
-        self.code_event     = threading.Event()
+        # Answer handoff between the socket handler and the interview loop.
+        # Used for BOTH typed verbal answers and submitted code — every
+        # question is answered by a `submit_answer` event now that the
+        # interview is fully text-based (no microphone/STT).
+        self.pending_answer  = None
+        self.awaiting_answer = False
+        self.answer_event    = threading.Event()
 
     def emit(self, event, data):
         self._socketio.emit(event, data, to=self.sid)

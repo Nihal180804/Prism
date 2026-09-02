@@ -4,7 +4,6 @@ import smtplib
 import re
 import logging
 import fitz
-import soundfile as sf
 import shutil
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -18,24 +17,12 @@ log = logging.getLogger("prism.backend")
 
 MISTRAL_URL   = os.getenv("MISTRAL_URL", "http://127.0.0.1:1234/v1/chat/completions")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-7b-instruct-v0.3")
-VOICE         = 'af_heart'
 SESSIONS_DIR  = "Job/sessions"
 JD_PATH       = "Job/Jd"
 RESUME_PATH   = "Job/resume"
 DONE_PATH     = "Job/done"
 EMAIL_SENDER  = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-
-# Lazy-loaded TTS pipeline — only initialised when first needed so importing
-# this module at Flask startup doesn't trigger a full model download/load.
-_pipeline = None
-
-def get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        from kokoro import KPipeline
-        _pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
-    return _pipeline
 
 
 # ── LLM helper ──────────────────────────────────────────────────────────────
@@ -121,19 +108,6 @@ def parse_questions(raw_response):
         else:
             questions.append({'type': 'verbal', 'text': line.strip()})
     return questions
-
-
-# ── TTS ──────────────────────────────────────────────────────────────────────
-
-def generate_tts_files(questions, output_dir):
-    pipeline = get_pipeline()
-    for i, q in enumerate(questions, 1):
-        text = q['text'] if isinstance(q, dict) else q
-        audio_gen = pipeline(text, voice=VOICE)
-        for _, _, audio in audio_gen:
-            out_path = os.path.join(output_dir, f"q{i}.wav")
-            sf.write(out_path, audio, 24000)
-            break
 
 
 # ── Email ────────────────────────────────────────────────────────────────────
@@ -232,9 +206,6 @@ def process_single_resume(resume_file_path, jd_text, progress_cb=None):
     with open(os.path.join(session_path, "meta.txt"), "w", encoding="utf-8") as f:
         f.write(f"email={email}\n")
         f.write(f"candidate_name={candidate_name or ''}\n")
-
-    cb("Generating audio files…")
-    generate_tts_files(questions, session_path)
 
     cb("Sending session email…")
     send_email(email, session_id, candidate_name)
