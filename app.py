@@ -5,7 +5,6 @@ import glob
 import time
 import uuid
 import hmac
-import secrets
 import logging
 import threading
 import shutil
@@ -15,35 +14,43 @@ from functools import wraps
 
 import cv2
 import simpleaudio as sa
-from dotenv import load_dotenv
 from flask import Flask, render_template, Response, request, jsonify
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv()
+
+from prism.config import settings
+from prism.interview.session import InterviewSession, SessionRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("prism")
 
-# ── Configuration (all overridable via .env) ──────────────────────────────────
-HOST               = os.getenv("HOST", "127.0.0.1")            # safe default: localhost only
-PORT               = int(os.getenv("PORT", "5000"))
-CORS_ORIGINS       = os.getenv("CORS_ALLOWED_ORIGINS", "*")
-CAMERA_INDEX       = int(os.getenv("CAMERA_INDEX", "0"))
-FACE_WARN_SECONDS  = float(os.getenv("FACE_WARN_SECONDS", "3"))
-FACE_EXIT_SECONDS  = float(os.getenv("FACE_EXIT_SECONDS", "15"))
-FACE_AUTO_EXIT     = os.getenv("FACE_AUTO_EXIT", "0") == "1"   # end interview when candidate leaves frame (off by default)
-RECRUITER_USER     = os.getenv("RECRUITER_USER", "recruiter")
-RECRUITER_PASSWORD = os.getenv("RECRUITER_PASSWORD")           # unset ⇒ dashboard is open (dev only)
-DEV_MODE           = os.getenv("PRISM_DEV", "0") == "1"        # enables the practice-session helper
+# ── Configuration ──────────────────────────────────────────────────────────────
+# All settings now live in prism/config.py. These module-level names are thin
+# aliases onto that single source of truth, kept so the rest of this file reads
+# unchanged; new code should prefer `settings.<name>` directly.
+HOST               = settings.host
+PORT               = settings.port
+CORS_ORIGINS       = settings.cors_origins
+CAMERA_INDEX       = settings.camera_index
+FACE_WARN_SECONDS  = settings.face_warn_seconds
+FACE_EXIT_SECONDS  = settings.face_exit_seconds
+FACE_AUTO_EXIT     = settings.face_auto_exit
+RECRUITER_USER     = settings.recruiter_user
+RECRUITER_PASSWORD = settings.recruiter_password
+DEV_MODE           = settings.dev_mode
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
+app.config['SECRET_KEY'] = settings.secret_key
 # Use plain threading (NOT gevent): the interview does blocking work — audio
 # playback, camera reads, Whisper STT, LLM calls — which would stall a gevent
 # event loop and drop the websocket. Threading runs those on real threads.
 socketio = SocketIO(app, cors_allowed_origins=CORS_ORIGINS, async_mode='threading')
+
+# Tracks active interview sessions by websocket sid (replaces the old
+# `active_session` global — see prism/interview/session.py).
+registry = SessionRegistry(socketio, settings.sessions_dir)
 
 if not RECRUITER_PASSWORD:
     log.warning("RECRUITER_PASSWORD is not set — the recruiter dashboard is UNPROTECTED. "
@@ -77,14 +84,15 @@ def require_recruiter_auth(f):
     return wrapped
 
 # ── Directory constants ──────────────────────────────────────────────────────
-SESSIONS_DIR    = "Job/sessions"
-RESPONSES_DIR   = "Job/responses"
-DONE_DIR        = "Job/done"
-EVALUATIONS_DIR = "Job/evaluations"
-JD_DIR          = "Job/Jd"
-RESUME_DIR      = "Job/resume"
+# Aliases onto prism/config.py (single source of truth).
+SESSIONS_DIR    = settings.sessions_dir
+RESPONSES_DIR   = settings.responses_dir
+DONE_DIR        = settings.done_dir
+EVALUATIONS_DIR = settings.evaluations_dir
+JD_DIR          = settings.jd_dir
+RESUME_DIR      = settings.resume_dir
 
-for d in [SESSIONS_DIR, RESPONSES_DIR, DONE_DIR, EVALUATIONS_DIR, JD_DIR, RESUME_DIR]:
+for d in settings.data_dirs:
     os.makedirs(d, exist_ok=True)
 
 # ── Shared camera ────────────────────────────────────────────────────────────
@@ -157,59 +165,9 @@ def video_feed():
 
 
 # ── Interview session ────────────────────────────────────────────────────────
-
-class InterviewSession:
-    def __init__(self, session_id, candidate_name, sid):
-        self.session_id     = session_id
-        self.candidate_name = candidate_name
-        self.sid            = sid
-        self.questions      = []   # list of {'type': 'coding'|'verbal', 'text': str}
-        self.responses      = []
-        self.current_q      = 0
-        self.stopping       = False
-        self.session_folder = os.path.join(SESSIONS_DIR, session_id)
-        # Coding-answer handoff between the socket handler and the interview loop
-        self.pending_code   = None
-        self.awaiting_code  = False
-        self.code_event     = threading.Event()
-
-    def emit(self, event, data):
-        socketio.emit(event, data, to=self.sid)
-
-    # Compatibility shim used by face_monitor
-    def insert_chat(self, sender, message):
-        self.emit('chat_message', {'sender': sender, 'message': message})
-
-    def exit_app(self):
-        self.stopping = True
-        self.emit('force_exit', {})
-
-    def load_questions(self):
-        q_path = os.path.join(self.session_folder, "questions.txt")
-        self.questions = []
-        with open(q_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                m = re.match(r'(CODING|VERBAL)\s*:\s*(.+)', line, re.I)
-                if m:
-                    self.questions.append({'type': m.group(1).lower(), 'text': m.group(2).strip()})
-                else:
-                    self.questions.append({'type': 'verbal', 'text': line})
-
-    def load_meta(self):
-        meta = {}
-        meta_path = os.path.join(self.session_folder, "meta.txt")
-        if os.path.exists(meta_path):
-            for line in open(meta_path, encoding='utf-8'):
-                if '=' in line:
-                    k, v = line.strip().split('=', 1)
-                    meta[k] = v
-        return meta
-
-
-active_session: InterviewSession = None
+# InterviewSession and SessionRegistry now live in prism/interview/session.py.
+# The process-wide STT recorder remains a singleton (server-side capture);
+# browser-side capture (roadmap P0) is what will finally make it per-session.
 recorder = None
 
 
@@ -437,18 +395,14 @@ def on_connect():
 
 @socketio.on('disconnect')
 def on_disconnect():
-    global active_session
-    log.info("WS disconnect %s (active sid=%s)", request.sid,
-             active_session.sid if active_session else None)
-    if active_session and active_session.sid == request.sid:
-        active_session.stopping = True
-        active_session = None
+    session = registry.remove(request.sid)
+    log.info("WS disconnect %s (had session=%s)", request.sid, bool(session))
+    if session:
+        session.stopping = True
 
 
 @socketio.on('start_interview')
 def on_start_interview(data):
-    global active_session, recorder
-
     session_id     = (data.get('session_id') or '').strip()
     candidate_name = (data.get('candidate_name') or '').strip()
 
@@ -467,15 +421,15 @@ def on_start_interview(data):
         emit('error', {'message': f'No session found for ID: {session_id}'})
         return
 
-    session = InterviewSession(session_id, candidate_name, request.sid)
+    session = registry.create(session_id, candidate_name, request.sid)
     try:
         session.load_questions()
     except Exception as e:
+        registry.remove(request.sid)
         emit('error', {'message': f'Could not load questions: {e}'})
         return
 
     meta = session.load_meta()
-    active_session = session
 
     # The STT recorder is started lazily on the first verbal question
     # (see _await_voice_answer), so coding-only stretches don't need a mic.
@@ -492,10 +446,9 @@ def on_start_interview(data):
 
 @socketio.on('exit_interview')
 def on_exit_interview():
-    global active_session
-    if active_session:
-        active_session.stopping = True
-        active_session = None
+    session = registry.remove(request.sid)
+    if session:
+        session.stopping = True
     exiting_wav = "speech/Exiting.wav"
     if os.path.exists(exiting_wav):
         threading.Thread(target=play_wav, args=(exiting_wav,), daemon=True).start()
@@ -544,8 +497,8 @@ def on_submit_code(data):
 def on_submit_answer(data):
     # Deliver the candidate's code as the answer to the current coding question,
     # unblocking the interview loop waiting in _await_code_answer.
-    s = active_session
-    log.info("submit_answer received: active_session=%s awaiting_code=%s",
+    s = registry.get(request.sid)
+    log.info("submit_answer received: session=%s awaiting_code=%s",
              bool(s), getattr(s, 'awaiting_code', None))
     if s and getattr(s, 'awaiting_code', False):
         s.pending_code  = data.get('code') or ''
