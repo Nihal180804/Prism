@@ -203,7 +203,7 @@
       background: var(--surface2); border: 1px solid var(--border);
       box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 5;
     }
-    #cam-feed { width: 100%; height: 100%; object-fit: cover; display: none; }
+    #cam-video { width: 100%; height: 100%; object-fit: cover; display: none; }
     .cam-avatar { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: var(--surface2); }
     .avatar-circle { width: 46px; height: 46px; border-radius: 50%; background: var(--surface); border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 1.3rem; }
     #avatar-initials { width: 46px; height: 46px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), var(--accent-l)); display: none; align-items: center; justify-content: center; font-size: 1rem; font-weight: 700; color: #fff; }
@@ -400,6 +400,17 @@
           </div>
           <div id="question-text">Preparing your session…</div>
           <div id="question-tip">Answer in the workspace on the right, then click <strong>Submit Answer</strong>.</div>
+          <!-- Clarify: candidate can ask the AI to explain the question (hint-only).
+               Hidden entirely unless the recruiter enabled it for this interview. -->
+          <div id="clarify-box" style="display:none; margin-top:10px;">
+            <div style="display:flex; gap:8px;">
+              <input id="clarify-input" type="text" placeholder="Ask the AI to clarify this question (it won't give the answer)…"
+                     style="flex:1; padding:8px 10px; border-radius:8px; border:1px solid rgba(148,163,184,.35); background:transparent; color:inherit; font:inherit;"/>
+              <button id="clarify-btn" onclick="askClarify()"
+                      style="padding:8px 12px; border-radius:8px; border:0; cursor:pointer; background:#6366f1; color:#fff; font:inherit;">Ask</button>
+            </div>
+            <div id="clarify-remaining" style="font-size:12px; opacity:.7; margin-top:4px;"></div>
+          </div>
         </div>
 
         <div id="status-bar">
@@ -410,9 +421,11 @@
         </div>
 
         <div id="chat-area">
-          <!-- Camera PiP -->
-          <div class="cam-wrap">
-            <img id="cam-feed" alt="Camera"/>
+          <!-- Camera PiP — the candidate's OWN webcam (browser capture). Hidden
+               entirely when the recruiter didn't enable the camera. -->
+          <div class="cam-wrap" id="cam-wrap">
+            <video id="cam-video" autoplay muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:inherit;"></video>
+            <canvas id="cam-canvas" style="display:none"></canvas>
             <div class="cam-avatar" id="cam-avatar">
               <div class="avatar-circle" id="avatar-icon">👤</div>
               <div id="avatar-initials"></div>
@@ -444,6 +457,8 @@
           <textarea id="code-editor"></textarea>
           <div class="answer-box" id="answer-box">
             <textarea id="answer-input" placeholder="Type your answer here. Be specific — explain your reasoning, name the concrete tools and decisions involved, and give examples where you can."></textarea>
+            <!-- Voice answer (browser mic → server STT). Hidden unless STT is enabled. -->
+            <button id="mic-btn" onclick="toggleMic()" style="display:none; align-self:flex-start; margin-top:8px; padding:8px 12px; border-radius:8px; border:1px solid rgba(148,163,184,.35); background:transparent; color:inherit; cursor:pointer; font:inherit;">🎤 Hold to speak</button>
           </div>
         </div>
 
@@ -598,6 +613,8 @@
       const ai = document.getElementById('answer-input');
       ai.value = '';
       ai.focus();
+      // Voice-answer button only for verbal questions, and only when STT is on.
+      document.getElementById('mic-btn').style.display = CAPS.stt ? 'inline-flex' : 'none';
     }
   }
 
@@ -649,22 +666,56 @@
     ],
   };
 
-  // ── Camera ─────────────────────────────────────────────────────────────────
-  const camFeed = document.getElementById('cam-feed');
+  // ── Camera (browser-side capture) ────────────────────────────────────────────
+  // The candidate's own webcam is captured here; a small downscaled frame is
+  // POSTed to /api/face every few seconds for the server-side presence check.
+  const camVideo  = document.getElementById('cam-video');
   const camAvatar = document.getElementById('cam-avatar');
-  const camBadge = document.getElementById('cam-badge');
-  let currentCamIndex = 0;
-  camFeed.onload  = () => { camFeed.style.display='block'; camAvatar.style.display='none'; camBadge.style.display='flex'; };
-  camFeed.onerror = () => { camFeed.style.display='none';  camAvatar.style.display='flex'; camBadge.style.display='none'; };
-  function switchCamera() {
-    const t = document.getElementById('cam-toggle'); t.classList.add('switching');
-    socket.emit('switch_camera', { index: (currentCamIndex + 1) % 4 });
+  const camBadge  = document.getElementById('cam-badge');
+  const camCanvas = document.getElementById('cam-canvas');
+  let camStream = null, camTimer = null, camDevices = [], camIdx = 0;
+
+  async function startBrowserCamera(deviceId) {
+    stopBrowserCamera();
+    try {
+      const constraints = { video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' }, audio: false };
+      camStream = await navigator.mediaDevices.getUserMedia(constraints);
+      camVideo.srcObject = camStream;
+      camVideo.style.display = 'block'; camAvatar.style.display = 'none'; camBadge.style.display = 'flex';
+      try { camDevices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch (e) {}
+      document.getElementById('cam-toggle').style.display = camDevices.length > 1 ? 'flex' : 'none';
+      camTimer = setInterval(sendFrame, 2500);   // presence check cadence
+    } catch (e) {
+      // Denied / unavailable (or non-HTTPS origin) — fall back to the avatar.
+      camVideo.style.display = 'none'; camAvatar.style.display = 'flex'; camBadge.style.display = 'none';
+      document.getElementById('cam-avatar-label').textContent = 'Camera blocked';
+      addMsg('🤖 Interviewer', 'This interview needs your camera. Please allow access (and use the secure https link), then rejoin.');
+    }
   }
-  socket.on('camera_switched', d => {
-    const t = document.getElementById('cam-toggle'); t.classList.remove('switching');
-    if (d.ok) { currentCamIndex = d.index; document.getElementById('cam-index-label').textContent = d.index; camFeed.src = '/video_feed?t=' + Date.now(); }
-    else { t.title = `Camera ${d.index} not found`; }
-  });
+  function stopBrowserCamera() {
+    if (camTimer) { clearInterval(camTimer); camTimer = null; }
+    if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+    if (camVideo) camVideo.srcObject = null;
+  }
+  function sendFrame() {
+    if (!camStream || !camVideo.videoWidth) return;
+    const w = 320, h = Math.round(w * camVideo.videoHeight / camVideo.videoWidth);
+    camCanvas.width = w; camCanvas.height = h;
+    camCanvas.getContext('2d').drawImage(camVideo, 0, 0, w, h);
+    camCanvas.toBlob(blob => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append('frame', blob, 'f.jpg');
+      fd.append('sid', socket.id);
+      fetch('/api/face', { method: 'POST', body: fd }).catch(() => {});
+    }, 'image/jpeg', 0.6);
+  }
+  function switchCamera() {
+    if (camDevices.length < 2) return;
+    camIdx = (camIdx + 1) % camDevices.length;
+    document.getElementById('cam-index-label').textContent = camIdx;
+    startBrowserCamera(camDevices[camIdx].deviceId);
+  }
   function updateAvatar(name) {
     if (!name) return;
     const initials = name.trim().split(/\s+/).map(w => w[0]).join('').toUpperCase().slice(0,2);
@@ -682,6 +733,13 @@
     if (pos <= 0.34) return '<span class="diff-pill diff-easy">Easy</span>';
     if (pos <= 0.67) return '<span class="diff-pill diff-medium">Medium</span>';
     return '<span class="diff-pill diff-hard">Hard</span>';
+  }
+  // Badge from an explicit difficulty tag ('easy' | 'medium' | 'hard').
+  function diffPill(diff) {
+    const d = String(diff || '').toLowerCase();
+    const cls = { easy: 'diff-easy', medium: 'diff-medium', hard: 'diff-hard' }[d] || 'diff-medium';
+    const label = d ? d.charAt(0).toUpperCase() + d.slice(1) : 'Medium';
+    return `<span class="diff-pill ${cls}">${label}</span>`;
   }
   function setStatus(state) {
     const icon=document.getElementById('status-icon'), text=document.getElementById('status-text');
@@ -768,9 +826,23 @@
     const b=document.getElementById('start-btn'); b.disabled=true; b.textContent='Begin Interview →';
   });
 
+  // Per-interview capabilities (TTS / STT / camera / clarify), from the server.
+  // Anything disabled has its UI hidden so there's never a dead/empty control.
+  let CAPS = { tts:false, stt:false, camera:false, clarify:false, clarify_max:0 };
+  function applyCapabilities(caps) {
+    CAPS = Object.assign(CAPS, caps || {});
+    // Camera PiP: show + capture the candidate's own webcam only when enabled.
+    const camWrap = document.getElementById('cam-wrap');
+    if (CAPS.camera) { camWrap.style.display = ''; startBrowserCamera(); }
+    else { camWrap.style.display = 'none'; stopBrowserCamera(); }
+    // Clarify control.
+    document.getElementById('clarify-box').style.display = CAPS.clarify ? 'block' : 'none';
+    updateClarifyRemaining(CAPS.clarify_max);
+  }
+
   socket.on('interview_started', d => {
     updateAvatar(d.candidate);
-    camFeed.src = '/video_feed';   // open the camera only now, not on page load
+    applyCapabilities(d.capabilities);
     document.getElementById('display-name').textContent = d.candidate;
     document.getElementById('display-session').textContent = document.getElementById('sid-input').value.trim();
     buildDots(d.total_questions);
@@ -784,7 +856,9 @@
   socket.on('question', d => {
     document.getElementById('question-label').textContent = `Question ${d.number} of ${d.total}`;
     document.getElementById('question-text').textContent  = d.text;
-    document.getElementById('diff-badge').innerHTML       = diffBadge(d.number, d.total);
+    // Use the real per-question difficulty tag when the backend provides one;
+    // otherwise fall back to the positional estimate.
+    document.getElementById('diff-badge').innerHTML       = d.difficulty ? diffPill(d.difficulty) : diffBadge(d.number, d.total);
     document.getElementById('question-tip').style.display = 'block';
     setProgress(d.progress);
     setQuestionType(d.type || 'verbal');
@@ -796,6 +870,7 @@
     if (d.level==='warn') setTimeout(()=>b.style.display='none', 5000);
   });
   socket.on('interview_complete', d => {
+    stopBrowserCamera();
     setProgress(100); setNavBadge('Complete'); document.getElementById('exit-btn').style.display='none';
     document.getElementById('results-sub').textContent = `Great work, ${d.candidate}! Your responses have been saved and will be reviewed.`;
     const grid=document.getElementById('results-grid'); grid.innerHTML='';
@@ -808,6 +883,7 @@
     showScreen('results');
   });
   socket.on('force_exit', () => {
+    stopBrowserCamera();
     setNavBadge('Session ended'); showScreen('login');
     const b=document.getElementById('start-btn'); b.disabled=true; b.textContent='Begin Interview →';
     document.getElementById('agree-check').checked=false;
@@ -815,6 +891,78 @@
 
   function exitInterview() { if (confirm('End the interview early?')) socket.emit('exit_interview'); }
   function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  // ── Clarify (hint-only) ─────────────────────────────────────────────────────
+  function updateClarifyRemaining(n) {
+    const el = document.getElementById('clarify-remaining');
+    if (n === null || n === undefined) { el.textContent = ''; return; }
+    el.textContent = n > 0 ? `${n} clarification${n===1?'':'s'} left for this question`
+                           : 'No clarifications left for this question';
+    document.getElementById('clarify-btn').disabled = n <= 0;
+    document.getElementById('clarify-input').disabled = n <= 0;
+  }
+  function askClarify() {
+    const inp = document.getElementById('clarify-input');
+    const msg = inp.value.trim();
+    socket.emit('clarify_request', { message: msg });
+    inp.value = '';
+  }
+  document.getElementById('clarify-input')?.addEventListener('keydown', e => { if (e.key==='Enter') askClarify(); });
+  socket.on('clarify_response', d => {
+    if (d.error) { addMsg('🤖 Interviewer', d.error); return; }
+    // The chat_message events already render the exchange; just update the counter.
+    if (d.remaining !== undefined) updateClarifyRemaining(d.remaining);
+  });
+  // Reset the clarify allowance whenever a new question arrives.
+  socket.on('question', () => { if (CAPS.clarify) updateClarifyRemaining(CAPS.clarify_max); });
+
+  // ── TTS playback (Kokoro audio streamed from the server) ─────────────────────
+  socket.on('question_audio', d => {
+    if (!CAPS.tts || !d.b64) return;
+    try {
+      const audio = new Audio('data:' + (d.mime||'audio/wav') + ';base64,' + d.b64);
+      audio.play().catch(()=>{});   // ignore autoplay blocks; text is always shown
+    } catch (e) {}
+  });
+
+  // ── Voice answers (browser mic → server STT) ─────────────────────────────────
+  let mediaRecorder = null, recChunks = [], recording = false;
+  async function toggleMic() {
+    const btn = document.getElementById('mic-btn');
+    if (recording) {                       // stop → upload → transcribe
+      recording = false;
+      btn.textContent = '⏳ Transcribing…'; btn.disabled = true;
+      mediaRecorder && mediaRecorder.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recChunks = [];
+      mediaRecorder = new MediaRecorder(stream);
+      mediaRecorder.ondataavailable = e => { if (e.data.size) recChunks.push(e.data); };
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(recChunks, { type: 'audio/webm' });
+        const fd = new FormData();
+        fd.append('audio', blob, 'answer.webm');
+        fd.append('sid', socket.id);
+        try {
+          const r = await fetch('/api/stt', { method:'POST', body: fd });
+          const j = await r.json();
+          if (r.ok && j.text) {
+            const ai = document.getElementById('answer-input');
+            ai.value = (ai.value ? ai.value + ' ' : '') + j.text;
+          } else { addMsg('🤖 Interviewer', j.error || 'Could not transcribe — please type your answer.'); }
+        } catch (e) { addMsg('🤖 Interviewer', 'Transcription failed — please type your answer.'); }
+        btn.textContent = '🎤 Hold to speak'; btn.disabled = false;
+      };
+      mediaRecorder.start();
+      recording = true;
+      btn.textContent = '⏹ Stop recording';
+    } catch (e) {
+      addMsg('🤖 Interviewer', 'Microphone unavailable — please type your answer.');
+    }
+  }
 
   // ── Demo mode (?demo=1) — preview the interview UI without the backend ───────
   if (DEMO) {

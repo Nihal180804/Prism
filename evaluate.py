@@ -1,19 +1,19 @@
 import os
-import glob
 import re
-import shutil
 import logging
 from datetime import datetime
 from typing import Dict, List
 
 from backend import ask_mistral, find_jd_file, extract_text_from_pdf
+from prism import persistence
+from prism.config import settings
 
 log = logging.getLogger("prism.evaluate")
 
-RESPONSES_DIR   = "Job/responses"
-EVALUATIONS_DIR = "Job/evaluations"
-DONE_DIR        = "Job/done"
-JD_DIR          = "Job/Jd"
+RESPONSES_DIR   = settings.responses_dir
+EVALUATIONS_DIR = settings.evaluations_dir
+DONE_DIR        = settings.done_dir
+JD_DIR          = settings.jd_dir
 
 
 def _load_jd_snippet() -> str:
@@ -69,41 +69,36 @@ class InterviewEvaluator:
     # ── Parsing ──────────────────────────────────────────────────────────────
 
     def parse_response_file(self, filepath: str) -> Dict:
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
+        """Read one interview record (JSON source-of-truth, or a legacy .txt).
 
-            sid   = re.search(r'Session ID: (.+)',     content)
-            name  = re.search(r'Candidate Name: (.+)', content)
-            date  = re.search(r'Date: (.+)',            content)
-            time_ = re.search(r'Time: (.+)',            content)
+        Delegates to prism.persistence so there is a single, well-tested reader;
+        returns None on error to match the previous contract.
+        """
+        rec = persistence.read_interview(filepath)
+        if rec is None:
+            log.error("Error parsing %s", filepath)
+        return rec
 
-            qa_pairs = []
-            for m in re.finditer(r'Q(\d+): (.+?)\nA\1: (.+?)(?=\n\nQ\d+:|\Z)', content, re.DOTALL):
-                qa_pairs.append({
-                    'question_num': int(m.group(1)),
-                    'question':     m.group(2).strip(),
-                    'answer':       m.group(3).strip(),
-                })
-
-            return {
-                'session_id':     sid.group(1).strip()  if sid   else 'Unknown',
-                'candidate_name': name.group(1).strip() if name  else 'Unknown',
-                'date':           date.group(1).strip() if date  else 'Unknown',
-                'time':           time_.group(1).strip() if time_ else 'Unknown',
-                'qa_pairs':       qa_pairs,
-                'filepath':       filepath,
-            }
-        except Exception as e:
-            log.error("Error parsing %s: %s", filepath, e)
-            return None
-
-    def build_eval_prompt(self, qa_pairs: List[Dict]) -> str:
+    def build_eval_prompt(self, qa_pairs: List[Dict], interviewer_notes: List[str] = None) -> str:
         lines = ["Evaluate each answer below and return scores in the required format.\n\nInterview Q&A:"]
         for qa in qa_pairs:
             lines.append(f"\nQ{qa['question_num']}: {qa['question']}")
             lines.append(f"A{qa['question_num']}: {qa['answer']}")
+        # The interviewer agent records a private judgement of each answer as it
+        # runs; surface those as context (not gospel) for the final scorer.
+        if interviewer_notes:
+            lines.append("\nInterviewer's live notes (for context only — judge the answers yourself):")
+            lines.extend(f"- {n}" for n in interviewer_notes)
         return "\n".join(lines)
+
+    @staticmethod
+    def _interviewer_notes(candidate: Dict) -> List[str]:
+        notes = []
+        for t in candidate.get("transcript", []):
+            a = t.get("assessment")
+            if a and a.get("score") is not None:
+                notes.append(f"Q{t.get('number')}: {a['score']}/100 — {a.get('comment', '')}".rstrip(" —"))
+        return notes
 
     def parse_eval_response(self, response: str) -> Dict:
         if not response:
@@ -169,43 +164,9 @@ class InterviewEvaluator:
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def save_evaluation(self, candidate: Dict, ev: Dict) -> str:
-        now      = datetime.now()
-        filename = f"evaluation_{candidate['candidate_name'].replace(' ','_')}_{candidate['session_id']}_{now.strftime('%Y%m%d_%H%M%S')}.txt"
-        filepath = os.path.join(EVALUATIONS_DIR, filename)
-
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write("=== INTERVIEW EVALUATION REPORT ===\n\n")
-            f.write(f"Candidate Name: {candidate['candidate_name']}\n")
-            f.write(f"Session ID: {candidate['session_id']}\n")
-            f.write(f"Interview Date: {candidate['date']}\n")
-            f.write(f"Interview Time: {candidate['time']}\n")
-            f.write(f"Evaluation Date: {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
-            f.write("=== SCORES ===\n")
-            f.write(f"Overall Score: {ev['overall_score']}/100\n")
-            f.write(f"Technical Score: {ev['technical_score']}/100\n")
-            f.write(f"Communication Score: {ev['communication_score']}/100\n\n")
-
-            if ev['individual_scores']:
-                f.write("=== INDIVIDUAL QUESTION SCORES ===\n")
-                for s in ev['individual_scores']:
-                    f.write(f"Question {s['question']}: {s['score']}/100\n")
-                    f.write(f"Feedback: {s['feedback']}\n\n")
-
-            f.write("=== STRENGTHS ===\n")
-            for s in ev['strengths']:
-                f.write(f"• {s}\n")
-            f.write("\n=== AREAS FOR IMPROVEMENT ===\n")
-            for s in ev['improvements']:
-                f.write(f"• {s}\n")
-            f.write(f"\n=== SUMMARY ===\n{ev['summary']}\n\n")
-
-            f.write("=== ORIGINAL Q&A PAIRS ===\n")
-            for qa in candidate['qa_pairs']:
-                f.write(f"Q{qa['question_num']}: {qa['question']}\n")
-                f.write(f"A{qa['question_num']}: {qa['answer']}\n\n")
-
-        return filepath
+        """Persist the evaluation as JSON (source of truth) + a .txt report."""
+        json_path, _txt_path = persistence.save_evaluation(EVALUATIONS_DIR, candidate, ev)
+        return json_path
 
     def update_summary(self, candidate: Dict, ev: Dict):
         summary_file = os.path.join(EVALUATIONS_DIR, "evaluation_summary.txt")
@@ -222,34 +183,23 @@ class InterviewEvaluator:
             f.write(f"Evaluation Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("-" * 80 + "\n\n")
 
-    def move_to_done(self, filepath: str):
-        filename = os.path.basename(filepath)
-        dest     = os.path.join(DONE_DIR, filename)
-        if os.path.exists(dest):
-            name, ext = os.path.splitext(filename)
-            dest = os.path.join(DONE_DIR, f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}")
-        shutil.move(filepath, dest)
-
     # ── Main entry point ─────────────────────────────────────────────────────
 
     def process_all_responses(self):
-        files = glob.glob(os.path.join(RESPONSES_DIR, "interview_responses_*.txt"))
-        if not files:
+        # list_interviews dedupes a session's JSON + .txt into one record and
+        # exposes every backing file via `_paths` for archival.
+        records = persistence.list_interviews([RESPONSES_DIR])
+        if not records:
             log.info("No response files found.")
             return {'total': 0, 'evaluated': 0, 'failed': 0}
 
-        log.info("Found %d response file(s).", len(files))
+        log.info("Found %d interview record(s).", len(records))
         evaluated = failed = 0
-        for filepath in files:
-            log.info("Processing: %s", os.path.basename(filepath))
-            candidate = self.parse_response_file(filepath)
-            if not candidate:
-                log.warning("  Skipped — parse failed.")
-                failed += 1
-                continue
+        for candidate in records:
+            log.info("Processing: %s", os.path.basename(candidate['filepath']))
 
-            log.info("  Evaluating with Mistral…")
-            prompt = self.build_eval_prompt(candidate['qa_pairs'])
+            log.info("  Evaluating with the LLM…")
+            prompt = self.build_eval_prompt(candidate['qa_pairs'], self._interviewer_notes(candidate))
             try:
                 raw = self.evaluate_with_llm(prompt)
             except Exception as e:
@@ -271,12 +221,12 @@ class InterviewEvaluator:
             log.info("  Report saved: %s", eval_path)
             self.update_summary(candidate, ev)
             log.info("  Overall score: %s/100", ev['overall_score'])
-            self.move_to_done(filepath)
+            persistence.move_to_done(candidate.get('_paths', [candidate['filepath']]), DONE_DIR)
             log.info("  Response moved to done/")
             evaluated += 1
 
         log.info("All done. Reports in '%s'.", EVALUATIONS_DIR)
-        return {'total': len(files), 'evaluated': evaluated, 'failed': failed}
+        return {'total': len(records), 'evaluated': evaluated, 'failed': failed}
 
 
 # ── Live code review (used by the candidate's coding panel) ───────────────────

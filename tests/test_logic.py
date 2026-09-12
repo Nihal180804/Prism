@@ -7,9 +7,12 @@ import pytest
 
 from backend import (
     parse_questions,
+    questions_from_slate,
+    SLATES,
     extract_email_from_text,
     extract_name_from_text,
     build_question_prompt,
+    detect_seniority,
 )
 from evaluate import InterviewEvaluator, parse_code_review
 
@@ -19,9 +22,17 @@ from evaluate import InterviewEvaluator, parse_code_review
 def test_parse_questions_tags_types():
     raw = "1. [VERBAL] What is a closure?\n2. [CODING] Reverse a linked list.\n3. Describe REST."
     qs = parse_questions(raw)
-    assert qs[0] == {"type": "verbal", "text": "What is a closure?"}
-    assert qs[1] == {"type": "coding", "text": "Reverse a linked list."}
-    assert qs[2] == {"type": "verbal", "text": "Describe REST."}  # untagged → verbal
+    assert qs[0] == {"type": "verbal", "difficulty": None, "text": "What is a closure?"}
+    assert qs[1] == {"type": "coding", "difficulty": None, "text": "Reverse a linked list."}
+    assert qs[2] == {"type": "verbal", "difficulty": None, "text": "Describe REST."}  # untagged → verbal
+
+
+def test_parse_questions_reads_difficulty_tag_either_order():
+    raw = ("1. [CODING][HARD] Design a rate limiter.\n"
+           "2. [EASY][VERBAL] What is a hash map?")
+    qs = parse_questions(raw)
+    assert qs[0] == {"type": "coding", "difficulty": "hard", "text": "Design a rate limiter."}
+    assert qs[1] == {"type": "verbal", "difficulty": "easy", "text": "What is a hash map?"}
 
 
 def test_parse_questions_falls_back_to_lines_when_unnumbered():
@@ -36,6 +47,62 @@ def test_parse_questions_ignores_blank_lines():
     qs = parse_questions(raw)
     assert [q["text"] for q in qs] == ["First", "Second"]
     assert all(q["type"] == "verbal" for q in qs)
+
+
+# ── Role seniority detection ──────────────────────────────────────────────────
+
+def test_detect_seniority_from_keywords():
+    assert detect_seniority("Hiring an SDE 1 to join our team") == "junior"
+    assert detect_seniority("Software Engineer II (SDE 2)") == "mid"
+    assert detect_seniority("Senior Backend Engineer") == "senior"
+    assert detect_seniority("Staff Engineer, Platform") == "staff"
+    assert detect_seniority("Junior Developer, entry-level") == "junior"
+
+
+def test_detect_seniority_from_years_and_default():
+    assert detect_seniority("Backend role requiring 6+ years of experience") == "senior"
+    assert detect_seniority("You have 3 years experience with Python") == "mid"
+    assert detect_seniority("We build cool things with Python") == "mid"  # no signal → default
+
+
+def test_detect_seniority_prefers_highest():
+    assert detect_seniority("Senior Staff Engineer") == "staff"
+
+
+def test_build_question_prompt_calibrates_to_level():
+    p = build_question_prompt("RESUME_MARKER", "Senior Backend Engineer, JD_MARKER")
+    assert "Senior" in p and "difficulty" in p.lower()
+
+
+# ── Slate: difficulty calibration is guaranteed, not model-dependent ──────────
+
+def test_every_slate_has_six_slots_and_two_coding():
+    for level, slate in SLATES.items():
+        assert len(slate) == 6, level
+        assert sum(1 for t, _ in slate if t == "coding") == 2, level
+
+
+def test_seniority_shifts_difficulty_harder():
+    hard = lambda lvl: sum(1 for _, d in SLATES[lvl] if d == "hard")
+    # Strictly more hard questions as seniority rises.
+    assert hard("junior") < hard("mid") < hard("senior") <= hard("staff")
+
+
+def test_questions_from_slate_forces_type_and_difficulty():
+    # Model returns three plain lines with NO tags and the wrong shape...
+    raw = "1. Explain closures.\n2. Reverse a string.\n3. Design a cache."
+    qs = questions_from_slate(raw, "senior")
+    # ...but the result matches the senior slate exactly (type + difficulty).
+    assert [(q["type"], q["difficulty"]) for q in qs] == SLATES["senior"]
+    assert qs[0]["text"] == "Explain closures."
+
+
+def test_questions_from_slate_pads_short_model_output():
+    qs = questions_from_slate("1. Only one line.", "mid")
+    assert len(qs) == 6                       # padded to the full slate
+    assert [(q["type"], q["difficulty"]) for q in qs] == SLATES["mid"]
+    assert qs[0]["text"] == "Only one line."
+    assert qs[5]["text"].startswith("(")      # placeholder for the missing slot
 
 
 # ── Résumé field extraction ───────────────────────────────────────────────────

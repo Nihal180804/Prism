@@ -9,18 +9,21 @@ import logging
 import threading
 import shutil
 from datetime import datetime
-from itertools import zip_longest
 from functools import wraps
 
 import cv2
+import numpy as np
 from flask import Flask, render_template, Response, request, jsonify
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from prism import persistence
 from prism.config import settings
 from prism.interview.session import InterviewSession, SessionRegistry
+from prism.agents import InterviewerAgent
+from prism.llm import default_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("prism")
@@ -32,7 +35,6 @@ log = logging.getLogger("prism")
 HOST               = settings.host
 PORT               = settings.port
 CORS_ORIGINS       = settings.cors_origins
-CAMERA_INDEX       = settings.camera_index
 FACE_WARN_SECONDS  = settings.face_warn_seconds
 FACE_EXIT_SECONDS  = settings.face_exit_seconds
 FACE_AUTO_EXIT     = settings.face_auto_exit
@@ -42,6 +44,15 @@ DEV_MODE           = settings.dev_mode
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = settings.secret_key
+# Reject oversized request bodies (resume/JD uploads) before they can exhaust
+# memory or disk. Werkzeug raises 413 once the body passes this limit.
+app.config['MAX_CONTENT_LENGTH'] = settings.max_content_length
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    limit_mb = settings.max_content_length // (1024 * 1024)
+    return jsonify({'error': f'Upload too large (limit {limit_mb} MB).'}), 413
 # Use plain threading (NOT gevent): the interview does blocking work — audio
 # playback, camera reads, Whisper STT, LLM calls — which would stall a gevent
 # event loop and drop the websocket. Threading runs those on real threads.
@@ -94,220 +105,198 @@ RESUME_DIR      = settings.resume_dir
 for d in settings.data_dirs:
     os.makedirs(d, exist_ok=True)
 
-# ── Shared camera ────────────────────────────────────────────────────────────
-_camera       = None
-_camera_lock  = threading.Lock()
-_camera_index = CAMERA_INDEX
-face_cascade  = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# ── Face monitor (browser-side capture) ───────────────────────────────────────
+# The candidate's OWN webcam is captured in their browser (getUserMedia) and a
+# small downscaled frame is POSTed to /api/face every couple of seconds. The
+# server runs the same lightweight OpenCV Haar-cascade presence check on those
+# frames — so proctoring works for REMOTE candidates over the tunnel, and no
+# server-side camera is opened. Detection is cheap and stays on the CPU.
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
-def get_camera():
-    global _camera
-    if _camera is None or not _camera.isOpened():
-        # Try DirectShow first (better USB webcam support on Windows),
-        # fall back to default backend if it fails
-        _camera = cv2.VideoCapture(_camera_index, cv2.CAP_DSHOW)
-        if not _camera.isOpened():
-            _camera = cv2.VideoCapture(_camera_index)
-    return _camera
+def _evaluate_face_presence(state, num_faces, now, warn_s, exit_s, auto_exit):
+    """Pure presence/integrity state machine (no OpenCV) — returns the list of
+    warning events to emit and mutates ``state`` in place. Unit-tested directly."""
+    events = []
+    if num_faces == 0:
+        state['multi_warned'] = False
+        if state['missing_start'] is None:
+            state['missing_start'] = now
+        elapsed = now - state['missing_start']
+        if elapsed > warn_s and not state['warned']:
+            events.append({'level': 'warn', 'message': 'No face detected — please stay in frame.'})
+            state['warned'] = True
+        # Auto-exit is opt-in and only once the candidate has been seen, so a
+        # camera warm-up / missed detection can't end the interview prematurely.
+        if auto_exit and state['seen_face'] and elapsed > exit_s:
+            events.append({'level': 'exit', 'message': 'Candidate not detected. Ending interview.'})
+            state['stop'] = True
+    elif num_faces > 1:
+        state['missing_start'] = None
+        state['warned'] = False
+        if not state['multi_warned']:
+            events.append({'level': 'warn', 'message': 'Multiple faces detected — only the candidate should be visible.'})
+            state['multi_warned'] = True
+    else:
+        state['seen_face'] = True
+        state['missing_start'] = None
+        state['warned'] = False
+        state['multi_warned'] = False
+    return events
 
 
-def release_camera():
-    global _camera
-    if _camera and _camera.isOpened():
-        _camera.release()
-        _camera = None
+def process_face_frame(session: InterviewSession, frame_bgr):
+    """Run the Haar cascade on one browser frame and emit any presence warnings."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    events = _evaluate_face_presence(
+        session.face_state, len(faces), time.time(),
+        FACE_WARN_SECONDS, FACE_EXIT_SECONDS, FACE_AUTO_EXIT,
+    )
+    for ev in events:
+        session.emit('warning', ev)
+    if session.face_state.get('stop'):
+        session.stopping = True
 
 
-@socketio.on('switch_camera')
-def on_switch_camera(data):
-    global _camera, _camera_index
-    requested = int(data.get('index', 0))
-    with _camera_lock:
-        if _camera and _camera.isOpened():
-            _camera.release()
-        _camera = cv2.VideoCapture(requested, cv2.CAP_DSHOW)
-        if not _camera.isOpened():
-            _camera = cv2.VideoCapture(requested)
-        if _camera.isOpened():
-            _camera_index = requested
-            emit('camera_switched', {'index': requested, 'ok': True})
-        else:
-            _camera = cv2.VideoCapture(_camera_index, cv2.CAP_DSHOW)
-            if not _camera.isOpened():
-                _camera = cv2.VideoCapture(_camera_index)
-            emit('camera_switched', {'index': requested, 'ok': False})
-
-
-# ── MJPEG video feed ─────────────────────────────────────────────────────────
-
-def gen_frames():
-    while True:
-        with _camera_lock:
-            cam = get_camera()
-            ret, frame = cam.read()
-        if not ret:
-            time.sleep(0.05)
-            continue
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (99, 102, 241), 2)
-        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        time.sleep(0.033)
-
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/api/face', methods=['POST'])
+def api_face():
+    """Receive a webcam frame from the candidate's browser for the presence check.
+    Bound to the caller's session by socket id; ignored unless camera is on."""
+    sid = request.form.get('sid') or ''
+    s = registry.get(sid)
+    if not s or not s.camera_enabled:
+        return ('', 204)
+    f = request.files.get('frame')
+    if not f:
+        return ('', 204)
+    frame = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
+    if frame is not None:
+        process_face_frame(s, frame)
+    return ('', 204)
 
 
 # ── Interview session ────────────────────────────────────────────────────────
 # InterviewSession and SessionRegistry now live in prism/interview/session.py.
 
 
-# ── Face monitor ─────────────────────────────────────────────────────────────
-
-def face_monitor_web(session: InterviewSession):
-    missing_start = None
-    warned        = False
-    multi_warned  = False
-    seen_face     = False   # never auto-exit until the candidate has been seen once
-
-    while not session.stopping:
-        with _camera_lock:
-            cam = get_camera()
-            ret, frame = cam.read()
-        if not ret:
-            time.sleep(1)
-            continue
-
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-
-        if len(faces) == 0:
-            multi_warned = False
-            if missing_start is None:
-                missing_start = time.time()
-            elapsed = time.time() - missing_start
-
-            if elapsed > FACE_WARN_SECONDS and not warned:
-                session.emit('warning', {'level': 'warn', 'message': 'No face detected — please stay in frame.'})
-                warned = True
-
-            # Auto-exit is opt-in AND only fires once we've actually detected the
-            # candidate — so camera warm-up / a missed detection can't kill the
-            # interview before it has even begun.
-            if FACE_AUTO_EXIT and seen_face and elapsed > FACE_EXIT_SECONDS:
-                session.emit('warning', {'level': 'exit', 'message': 'Candidate not detected. Ending interview.'})
-                session.stopping = True
-                break
-        elif len(faces) > 1:
-            # More than one person in frame — flag as a possible integrity issue.
-            missing_start = None
-            warned        = False
-            if not multi_warned:
-                session.emit('warning', {'level': 'warn', 'message': 'Multiple faces detected — only the candidate should be visible.'})
-                multi_warned = True
-        else:
-            seen_face     = True
-            missing_start = None
-            warned        = False
-            multi_warned  = False
-
-        time.sleep(1)
-
-
 # ── Interview flow ────────────────────────────────────────────────────────────
 # The interview is fully text-based: questions are shown on screen (no TTS) and
 # every answer — typed prose for verbal questions, editor contents for coding
 # ones — arrives via the `submit_answer` socket event. There is no audio or STT.
+#
+# The interview is conducted by an agent (prism/agents/interviewer.py): it works
+# through the planned questions but decides — as explicit tool calls — when to
+# probe deeper and records a private assessment of each answer. The agent is
+# fenced so it always completes and always covers every planned question; if the
+# LLM is offline it degrades to a clean linear interview (see _run_linear).
+
+
+def _meta_flag(meta, key, default):
+    """Read a truthy per-session flag from meta.txt, falling back to a default."""
+    v = meta.get(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _jd_snippet() -> str:
+    """Best-effort role context for the interviewer agent (never fatal)."""
+    try:
+        from evaluate import _load_jd_snippet
+        return _load_jd_snippet()
+    except Exception:
+        return ""
+
+
+def _speak(session: InterviewSession, text: str):
+    """Voice a question with Kokoro TTS (off the interview thread) and stream the
+    audio to the candidate's tab. No-op when TTS is disabled or unavailable."""
+    if not session.tts_enabled:
+        return
+
+    def worker():
+        import base64
+        from prism.media import tts
+        audio = tts.synthesize(text)
+        if audio:
+            session.emit('question_audio', {
+                'b64': base64.b64encode(audio).decode('ascii'), 'mime': 'audio/wav',
+            })
+
+    threading.Thread(target=worker, daemon=True).start()
+
 
 def run_interview(session: InterviewSession):
-    total = len(session.questions)
-    for i, q in enumerate(session.questions):
-        if session.stopping:
-            break
+    if not session.questions:
+        _finish_interview(session)
+        return
 
-        q_num    = i + 1
-        qtype    = q.get('type', 'verbal') if isinstance(q, dict) else 'verbal'
-        qtext    = q.get('text', q)        if isinstance(q, dict) else q
-        progress = round((i / total) * 100)
-
-        session.emit('question', {
-            'number':   q_num,
-            'total':    total,
-            'text':     qtext,
-            'type':     qtype,
-            'progress': progress,
-        })
-
-        if session.stopping:
-            break
-
-        answer = _await_answer(session, qtype)
-
-        if session.stopping:
-            break
-
-        session.emit('chat_message', {'sender': 'You', 'message': answer})
-        session.emit('status', {'state': 'idle'})
-        session.responses.append(answer)
+    if settings.agent_enabled:
+        # Give the agent the live code reviewer so it can tell when a coding
+        # answer is weak and follow up with another coding challenge.
+        from evaluate import review_code
+        agent = InterviewerAgent(
+            default_client,
+            max_followups=settings.agent_max_followups,
+            max_code_followups=settings.agent_max_code_followups,
+            max_steps=settings.agent_max_steps,
+            code_reviewer=review_code,
+            code_followup_threshold=settings.agent_code_followup_threshold,
+            speak=_speak,
+        )
+        agent.run(session, jd_snippet=_jd_snippet(), level=session.level)
+    else:
+        _run_linear(session)
 
     if not session.stopping:
         _finish_interview(session)
 
 
-def _await_answer(session: InterviewSession, qtype: str):
-    """Block the interview thread until the candidate submits an answer.
-
-    Both question kinds are answered the same way — via `submit_answer` — so
-    this one waiter serves coding (editor contents) and verbal (typed prose).
-    The only difference is the status hint the candidate sees while answering.
-    """
-    session.pending_answer  = None
-    session.answer_event.clear()
-    session.emit('status', {'state': 'coding' if qtype == 'coding' else 'answering'})
-    session.awaiting_answer = True   # accept a submission only once the event is cleared
-
-    while not session.answer_event.wait(timeout=1):
+def _run_linear(session: InterviewSession):
+    """Deterministic fallback (AGENT_ENABLED=0): ask each planned question in
+    order with no LLM decisions. This is also what the agent degrades to when
+    the model is unavailable."""
+    total = len(session.questions)
+    for i, q in enumerate(session.questions):
         if session.stopping:
-            session.awaiting_answer = False
-            return "[No answer submitted]"
-
-    session.awaiting_answer = False
-    answer = (session.pending_answer or "").strip()
-    return answer if answer else "[No answer submitted]"
+            break
+        qtype = q.get('type', 'verbal')
+        qtext = q['text']
+        qdiff = q.get('difficulty')
+        session.current_question = {'number': i + 1, 'type': qtype, 'text': qtext}
+        session.emit('chat_message', {'sender': '🤖 Interviewer', 'message': qtext})
+        session.emit('question', {
+            'number': i + 1, 'total': total, 'text': qtext,
+            'type': qtype, 'difficulty': qdiff, 'progress': round((i / total) * 100) if total else 0,
+        })
+        session.emit('status', {'state': 'coding' if qtype == 'coding' else 'answering'})
+        _speak(session, qtext)
+        session.begin_await()
+        answer = session.wait_for_answer()
+        session.emit('chat_message', {'sender': 'You', 'message': answer})
+        session.emit('status', {'state': 'idle'})
+        session.transcript.append({
+            'number': i + 1, 'type': qtype, 'question': qtext, 'difficulty': qdiff,
+            'answer': answer, 'is_followup': False, 'assessment': None,
+        })
 
 
 def _finish_interview(session: InterviewSession):
     session.emit('status', {'state': 'saving'})
 
-    now           = datetime.now()
-    safe_name     = session.candidate_name.replace(" ", "_")
-    filename      = f"interview_responses_{safe_name}_{now.strftime('%Y-%m-%d_%H-%M-%S')}_{session.session_id}.txt"
-    filepath      = os.path.join(RESPONSES_DIR, filename)
-
-    # Questions are stored as {'type','text'} dicts — flatten to plain text.
-    question_texts = [q['text'] if isinstance(q, dict) else q for q in session.questions]
+    now = datetime.now()
+    record = {
+        'session_id':     session.session_id,
+        'candidate_name': session.candidate_name,
+        'date':           now.strftime('%Y-%m-%d'),
+        'time':           now.strftime('%H:%M:%S'),
+        'agreed_at':      session.agreed_at,
+        'transcript':     session.transcript,   # planned Q&A + follow-ups + notes
+    }
 
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(f"Session ID: {session.session_id}\n")
-            f.write(f"Candidate Name: {session.candidate_name}\n")
-            f.write(f"Date: {now.strftime('%Y-%m-%d')}\n")
-            f.write(f"Time: {now.strftime('%H:%M:%S')}\n")
-            f.write(f"Agreed to interview rules: yes ({session.agreed_at or 'unknown'})\n\n")
-            # zip_longest (not zip) so an interview that ended early still
-            # records every question — unanswered ones get an explicit marker
-            # instead of being silently dropped.
-            for i, (q, a) in enumerate(zip_longest(question_texts, session.responses), 1):
-                if q is None:
-                    q = "[Unknown question]"
-                if a is None:
-                    a = "[Not reached — interview ended before this question]"
-                f.write(f"Q{i}: {q}\nA{i}: {a}\n\n")
+        persistence.save_interview(RESPONSES_DIR, record)
     except Exception as e:
         log.error("Failed to save responses: %s", e)
 
@@ -319,10 +308,12 @@ def _finish_interview(session: InterviewSession):
     except Exception as e:
         log.error("Failed to move session folder: %s", e)
 
+    # Parallel arrays for the results screen — every asked question (including
+    # follow-ups), in order, alongside its answer.
     session.emit('interview_complete', {
         'candidate':  session.candidate_name,
-        'questions':  question_texts,
-        'responses':  session.responses,
+        'questions':  [t['question'] for t in session.transcript],
+        'responses':  [t['answer']   for t in session.transcript],
     })
     session.stopping = True
 
@@ -378,16 +369,34 @@ def on_start_interview(data):
         return
 
     meta = session.load_meta()
+    session.level = meta.get('level')   # role seniority → calibrates dynamic follow-ups
     session.agreed_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Per-interview media features: the recruiter's per-session choice (in meta)
+    # overrides the global default. When off, the candidate UI hides the control.
+    session.tts_enabled     = _meta_flag(meta, 'tts',     settings.tts_enabled_default)
+    session.stt_enabled     = _meta_flag(meta, 'stt',     settings.stt_enabled_default)
+    session.camera_enabled  = _meta_flag(meta, 'camera',  settings.camera_enabled_default)
+    session.clarify_enabled = _meta_flag(meta, 'clarify', settings.clarify_enabled_default)
+    session.clarify_max     = settings.clarify_max_per_question
 
     emit('interview_started', {
         'total_questions': len(session.questions),
         'candidate':       candidate_name,
         'meta':            meta,
+        # The candidate UI switches features on/off from this — no dead space when off.
+        'capabilities': {
+            'tts':         session.tts_enabled,
+            'stt':         session.stt_enabled,
+            'camera':      session.camera_enabled,
+            'clarify':     session.clarify_enabled,
+            'clarify_max': session.clarify_max,
+        },
     })
 
-    threading.Thread(target=face_monitor_web, args=(session,), daemon=True).start()
-    threading.Thread(target=run_interview,    args=(session,), daemon=True).start()
+    # Face monitoring (when enabled) is driven by frames the candidate's browser
+    # POSTs to /api/face — no server-side camera thread to start here.
+    threading.Thread(target=run_interview, args=(session,), daemon=True).start()
 
 
 @socketio.on('exit_interview')
@@ -440,116 +449,106 @@ def on_submit_code(data):
 def on_submit_answer(data):
     # Deliver the candidate's answer (typed prose for a verbal question, or
     # editor contents for a coding one) to the current question, unblocking the
-    # interview loop waiting in _await_answer.
+    # interview loop blocked in session.wait_for_answer().
     s = registry.get(request.sid)
     answer = data.get('answer')
     if answer is None:                      # tolerate older clients that sent {code: ...}
         answer = data.get('code') or ''
-    log.info("submit_answer received: session=%s awaiting=%s",
-             bool(s), getattr(s, 'awaiting_answer', None))
-    if s and getattr(s, 'awaiting_answer', False):
-        s.pending_answer  = answer
-        s.awaiting_answer = False
-        s.answer_event.set()
-        log.info("submit_answer accepted — advancing interview")
+    # session.submit() is atomic (see InterviewSession): it accepts the answer
+    # only if the loop is awaiting one, so a double-click can't advance twice.
+    accepted = s.submit(answer) if s else False
+    log.info("submit_answer received: session=%s accepted=%s", bool(s), accepted)
+
+
+@socketio.on('clarify_request')
+def on_clarify_request(data):
+    """Candidate asks the AI to clarify the current question. Hint-only and
+    capped per question; the guardrail (prism/clarify.py) never reveals the
+    answer."""
+    s = registry.get(request.sid)
+    if not s or not s.clarify_enabled:
+        emit('clarify_response', {'error': 'Clarifications are not available in this interview.'})
+        return
+    q = s.current_question
+    if not q:
+        emit('clarify_response', {'error': 'No question is active right now.'})
+        return
+
+    used = s.clarify_used.get(q['number'], 0)
+    if used >= s.clarify_max:
+        emit('clarify_response', {
+            'message': "You've used all your clarifications for this question — answer as best you can.",
+            'remaining': 0,
+        })
+        return
+
+    message = (data.get('message') or '').strip()
+    from prism.clarify import clarify
+    reply = clarify(default_client, q['text'], q['type'], message)
+    s.clarify_used[q['number']] = used + 1
+    remaining = s.clarify_max - (used + 1)
+
+    # Echo into the chat transcript so the exchange is visible.
+    if message:
+        s.emit('chat_message', {'sender': 'You', 'message': f'💬 {message}'})
+    s.emit('chat_message', {'sender': '🤖 Interviewer', 'message': reply})
+    emit('clarify_response', {'message': reply, 'remaining': remaining})
+
+
+@app.route('/api/stt', methods=['POST'])
+def api_stt():
+    """Transcribe a browser-recorded audio clip for a verbal answer. Bound to the
+    caller's live session (by socket id) so it only works when STT is enabled."""
+    sid = request.form.get('sid') or ''
+    s = registry.get(sid)
+    if not s or not s.stt_enabled:
+        return jsonify({'error': 'STT not enabled for this session'}), 403
+    audio = request.files.get('audio')
+    if not audio:
+        return jsonify({'error': 'No audio uploaded'}), 400
+    from prism.media import stt
+    text = stt.transcribe(audio.read())
+    if text is None:
+        return jsonify({'error': 'Transcription unavailable'}), 503
+    return jsonify({'text': text})
 
 
 # ── Data helpers (recruiter API) ─────────────────────────────────────────────
-
-def _read_response_file(fpath):
-    try:
-        with open(fpath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        sid   = re.search(r'Session ID: (.+)',     content)
-        name  = re.search(r'Candidate Name: (.+)', content)
-        date  = re.search(r'Date: (.+)',            content)
-        time_ = re.search(r'Time: (.+)',            content)
-        qa    = re.findall(r'^Q\d+:', content, re.MULTILINE)
-        return {
-            'session_id':     (sid.group(1).strip()  if sid  else 'unknown'),
-            'candidate_name': (name.group(1).strip() if name else 'Unknown'),
-            'date':           (date.group(1).strip() if date else '-'),
-            'time':           (time_.group(1).strip() if time_ else '-'),
-            'questions_count': len(qa),
-            'filepath':       fpath,
-            'filename':       os.path.basename(fpath),
-        }
-    except Exception:
-        return None
-
-
-def _read_eval_file(fpath):
-    try:
-        with open(fpath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        overall = re.search(r'Overall Score: (\d+)/100',       content)
-        tech    = re.search(r'Technical Score: (\d+)/100',     content)
-        comm    = re.search(r'Communication Score: (\d+)/100', content)
-        sid     = re.search(r'Session ID: (.+)',                content)
-        name    = re.search(r'Candidate Name: (.+)',            content)
-
-        strengths = []
-        s_section = re.search(r'=== STRENGTHS ===\n(.*?)(?===)', content, re.DOTALL)
-        if s_section:
-            strengths = [l.strip('• \n') for l in s_section.group(1).strip().splitlines() if l.strip()]
-
-        improvements = []
-        i_section = re.search(r'=== AREAS FOR IMPROVEMENT ===\n(.*?)(?===)', content, re.DOTALL)
-        if i_section:
-            improvements = [l.strip('• \n') for l in i_section.group(1).strip().splitlines() if l.strip()]
-
-        summary_m = re.search(r'=== SUMMARY ===\n(.*?)(?===|\Z)', content, re.DOTALL)
-        summary   = summary_m.group(1).strip() if summary_m else ''
-
-        individual = []
-        for m in re.finditer(r'Question (\d+): (\d+)/100\nFeedback: (.+?)(?=\n\n|\nQuestion|\Z)', content, re.DOTALL):
-            individual.append({'q': int(m.group(1)), 'score': int(m.group(2)), 'feedback': m.group(3).strip()})
-
-        return {
-            'session_id':         (sid.group(1).strip()  if sid     else 'unknown'),
-            'candidate_name':     (name.group(1).strip() if name    else 'Unknown'),
-            'overall_score':      (int(overall.group(1)) if overall else 0),
-            'technical_score':    (int(tech.group(1))    if tech    else 0),
-            'communication_score':(int(comm.group(1))    if comm    else 0),
-            'strengths':          strengths,
-            'improvements':       improvements,
-            'summary':            summary,
-            'individual_scores':  individual,
-            'filename':           os.path.basename(fpath),
-        }
-    except Exception:
-        return None
+# All reads go through prism.persistence, which prefers the JSON source of truth
+# and falls back to legacy .txt files. No regex parsing of answer content here.
 
 
 def collect_candidates():
-    completed_sids = {}
     candidates     = []
+    completed_sids = set()
 
-    # Completed interviews: response files start in RESPONSES_DIR and are moved
-    # to DONE_DIR once evaluated, so scan BOTH — otherwise evaluated candidates
-    # would vanish from the tables. Dedupe by session, newest first.
-    response_files = []
-    for base in (RESPONSES_DIR, DONE_DIR):
-        if os.path.isdir(base):
-            for fname in os.listdir(base):
-                if fname.startswith('interview_responses_') and fname.endswith('.txt'):
-                    response_files.append(os.path.join(base, fname))
-    response_files.sort(key=os.path.basename, reverse=True)
-
-    for fpath in response_files:
-        data = _read_response_file(fpath)
-        if not data or data['session_id'] in completed_sids:
+    # Completed interviews: records start in RESPONSES_DIR and move to DONE_DIR
+    # once evaluated, so scan BOTH — otherwise evaluated candidates would vanish
+    # from the tables. list_interviews dedupes by session, newest first.
+    for rec in persistence.list_interviews([RESPONSES_DIR, DONE_DIR]):
+        sid = rec.get('session_id', 'unknown')
+        if sid in completed_sids:
             continue
-        completed_sids[data['session_id']] = True
-        # Check for evaluation
-        eval_pattern = os.path.join(EVALUATIONS_DIR, f"evaluation_*_{data['session_id']}_*.txt")
-        eval_files   = sorted(glob.glob(eval_pattern), reverse=True)
-        score        = None
-        if eval_files:
-            ev = _read_eval_file(eval_files[0])
+        completed_sids.add(sid)
+
+        score     = None
+        eval_path = persistence.find_evaluation(EVALUATIONS_DIR, sid)
+        if eval_path:
+            ev = persistence.read_evaluation(eval_path)
             if ev:
                 score = ev['overall_score']
-        candidates.append({**data, 'status': 'evaluated' if score is not None else 'completed', 'score': score})
+
+        candidates.append({
+            'session_id':      sid,
+            'candidate_name':  rec.get('candidate_name', 'Unknown'),
+            'date':            rec.get('date', '-'),
+            'time':            rec.get('time', '-'),
+            'questions_count': len(rec.get('qa_pairs', [])),
+            'filepath':        rec.get('filepath'),
+            'filename':        rec.get('filename'),
+            'status':          'evaluated' if score is not None else 'completed',
+            'score':           score,
+        })
 
     # Pending sessions (not yet interviewed)
     if os.path.exists(SESSIONS_DIR):
@@ -612,11 +611,19 @@ def api_candidates():
 @app.route('/api/evaluations')
 @require_recruiter_auth
 def api_evaluations():
-    results = []
+    # Enumerate JSON (source of truth) first, then legacy .txt; dedupe by
+    # basename stem so a JSON record wins over its own .txt rendering.
+    by_stem = {}
+    for fpath in sorted(glob.glob(os.path.join(EVALUATIONS_DIR, "evaluation_*.json")), reverse=True):
+        by_stem[os.path.splitext(os.path.basename(fpath))[0]] = fpath
     for fpath in sorted(glob.glob(os.path.join(EVALUATIONS_DIR, "evaluation_*.txt")), reverse=True):
         if os.path.basename(fpath) == "evaluation_summary.txt":
             continue
-        data = _read_eval_file(fpath)
+        by_stem.setdefault(os.path.splitext(os.path.basename(fpath))[0], fpath)
+
+    results = []
+    for fpath in by_stem.values():
+        data = persistence.read_evaluation(fpath)
         if data:
             results.append(data)
     return jsonify(results)
@@ -625,11 +632,10 @@ def api_evaluations():
 @app.route('/api/evaluation/<session_id>')
 @require_recruiter_auth
 def api_evaluation_detail(session_id):
-    pattern = os.path.join(EVALUATIONS_DIR, f"evaluation_*_{session_id}_*.txt")
-    files   = sorted(glob.glob(pattern), reverse=True)
-    if not files:
+    path = persistence.find_evaluation(EVALUATIONS_DIR, session_id)
+    if not path:
         return jsonify({'error': 'Not found'}), 404
-    data = _read_eval_file(files[0])
+    data = persistence.read_evaluation(path)
     return jsonify(data) if data else (jsonify({'error': 'Parse failed'}), 500)
 
 
@@ -665,8 +671,25 @@ def api_upload():
     if not saved_resumes:
         return jsonify({'error': 'No valid PDF resumes uploaded'}), 400
 
+    # Per-interview media features the recruiter ticked (default to the global
+    # config default when the field is absent, e.g. an older client).
+    def _form_flag(name, default):
+        v = request.form.get(name)
+        return default if v is None else str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+    features = {
+        'tts':     _form_flag('tts',     settings.tts_enabled_default),
+        'stt':     _form_flag('stt',     settings.stt_enabled_default),
+        'camera':  _form_flag('camera',  settings.camera_enabled_default),
+        'clarify': _form_flag('clarify', settings.clarify_enabled_default),
+    }
+
     job_id = datetime.now().strftime('%Y%m%d%H%M%S')
     _processing_jobs[job_id] = {'status': 'running', 'log': [], 'results': []}
+    # Bound the in-memory job registry — keep only the most recent 20 so a
+    # long-running server doesn't accumulate finished jobs forever.
+    if len(_processing_jobs) > 20:
+        for stale in sorted(_processing_jobs)[:-20]:
+            _processing_jobs.pop(stale, None)
 
     def run_processing():
         from backend import extract_text_from_pdf, process_single_resume
@@ -677,7 +700,7 @@ def api_upload():
                     _processing_jobs[job_id]['log'].append(msg)
                     socketio.emit('upload_progress', {'job_id': job_id, 'message': msg})
                 try:
-                    result = process_single_resume(rpath, jd_text, progress_cb=cb)
+                    result = process_single_resume(rpath, jd_text, progress_cb=cb, features=features)
                     _processing_jobs[job_id]['results'].append({'ok': True, **result})
                     socketio.emit('upload_progress', {'job_id': job_id, 'message': f"✅ Session {result['session_id']} created", 'done_one': True})
                 except Exception as e:
@@ -721,9 +744,9 @@ def api_run_evaluation():
 
 # Fixed mixed coding/verbal set for the dev practice session (no LLM/email needed)
 PRACTICE_QUESTIONS = [
-    ('coding', 'Write a function two_sum(nums, target) that returns the indices of the two numbers that add up to target.'),
-    ('coding', 'Write a function is_palindrome(s) that returns True if the string is a palindrome, ignoring case and non-alphanumeric characters.'),
-    ('verbal', 'To finish, briefly tell me about a project you are proud of and your role in it.'),
+    ('coding', 'easy',   'Write a function two_sum(nums, target) that returns the indices of the two numbers that add up to target.'),
+    ('coding', 'medium', 'Write a function is_palindrome(s) that returns True if the string is a palindrome, ignoring case and non-alphanumeric characters.'),
+    ('verbal', 'medium', 'To finish, briefly tell me about a project you are proud of and your role in it.'),
 ]
 
 
@@ -736,10 +759,13 @@ def api_dev_practice_session():
     folder = os.path.join(SESSIONS_DIR, sid)
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, 'questions.txt'), 'w', encoding='utf-8') as f:
-        for qtype, text in PRACTICE_QUESTIONS:
-            f.write(f"{qtype.upper()}: {text}\n")
+        for qtype, diff, text in PRACTICE_QUESTIONS:
+            f.write(f"{qtype.upper()}|{diff}: {text}\n")
     with open(os.path.join(folder, 'meta.txt'), 'w', encoding='utf-8') as f:
-        f.write("email=practice@example.com\ncandidate_name=Practice Candidate\n")
+        f.write("email=practice@example.com\ncandidate_name=Practice Candidate\nlevel=mid\n")
+        # Practice sessions enable clarify (testable with no extra models) and
+        # leave TTS/STT/camera off by default.
+        f.write("clarify=1\ntts=0\nstt=0\ncamera=0\n")
     log.info("Created dev practice session %s", sid)
     return jsonify({'session_id': sid})
 

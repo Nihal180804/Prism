@@ -1,0 +1,22 @@
+# Optional media models for Prism — enable per-interview TTS (read questions
+# aloud) and STT (voice answers). The base app runs fine without these; install
+# them only if you want audio features.
+#
+#   pip install -r requirements-media.txt
+#   python scripts/prefetch_models.py     # warms the model cache (one-time)
+#
+# The model WEIGHTS are not committed to the repo (too big for git) — they
+# download from Hugging Face on first use and cache under ~/.cache/huggingface.
+
+kokoro>=0.9            # Kokoro-82M text-to-speech (pulls torch, transformers, misaki)
+soundfile              # WAV encoding for the synthesized audio
+faster-whisper>=1.0    # speech-to-text (the RealtimeSTT engine; CTranslate2-based)
+
+# transformers (pulled by kokoro) needs a modern protobuf. Pin it to avoid the
+# "cannot import name 'runtime_version' from google.protobuf" error that an old
+# protobuf (e.g. 4.x left behind by tensorflow) causes.
+protobuf>=5.26
+
+# NOTE: torch arrives as a kokoro dependency (CPU build by default). For GPU TTS
+# install the CUDA build of torch separately, per https://pytorch.org.
+# Kokoro also auto-installs the spaCy 'en_core_web_sm' model on first run.

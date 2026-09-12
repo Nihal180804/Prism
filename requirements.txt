@@ -8,3 +8,10 @@ werkzeug
 
 # Dev / testing
 pytest
+
+# ── Optional media features (per-interview TTS / STT) ─────────────────────────
+# Install these only if you want audio. Models are NOT bundled (too big for git)
+# — they download from Hugging Face on first use and cache locally:
+#   pip install -r requirements-media.txt
+#   python scripts/prefetch_models.py      # warms the model cache (one-time)
+# Without them the app runs text-only and the features stay hidden in the UI.

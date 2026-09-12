@@ -543,9 +543,15 @@
       <div class="process-card">
         <h3>Process & Generate Sessions</h3>
         <p>
-          For each resume: questions are generated using Mistral, audio files are synthesised,
+          For each resume: questions are generated (difficulty calibrated to the JD's role level)
           and a session ID is emailed to the candidate.
         </p>
+        <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:16px;font-size:0.85rem">
+          <label title="Read questions aloud with Kokoro TTS"><input type="checkbox" id="feat-tts"/> 🔊 Read questions aloud (TTS)</label>
+          <label title="Let candidates answer verbal questions by voice"><input type="checkbox" id="feat-stt"/> 🎤 Voice answers (STT)</label>
+          <label title="Webcam presence / face monitoring"><input type="checkbox" id="feat-camera"/> 📷 Camera monitoring</label>
+          <label title="Let candidates ask the AI to clarify a question (never the answer)"><input type="checkbox" id="feat-clarify" checked/> 💬 Allow AI clarifications</label>
+        </div>
         <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px">
           <button class="btn btn-primary" id="process-btn" onclick="startProcessing()">
             Generate Sessions
@@ -782,6 +788,11 @@
     const fd = new FormData();
     fd.append('jd_file', jdFiles[0]);
     Array.from(resumeFiles).forEach(f => fd.append('resume_files', f));
+    // Per-interview media features chosen by the recruiter.
+    fd.append('tts',     document.getElementById('feat-tts').checked     ? '1' : '0');
+    fd.append('stt',     document.getElementById('feat-stt').checked     ? '1' : '0');
+    fd.append('camera',  document.getElementById('feat-camera').checked  ? '1' : '0');
+    fd.append('clarify', document.getElementById('feat-clarify').checked ? '1' : '0');
 
     try {
       const res = await fetch('/api/upload', { method: 'POST', body: fd });

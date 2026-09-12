@@ -39,14 +39,73 @@ class Settings:
     recruiter_user: str = os.getenv("RECRUITER_USER", "recruiter")
     recruiter_password: Optional[str] = os.getenv("RECRUITER_PASSWORD")   # unset ⇒ dashboard open (dev only)
 
-    # ── Camera / face monitor ──────────────────────────────────────────────────
-    camera_index: int = int(os.getenv("CAMERA_INDEX", "0"))
+    # ── Face monitor (browser-captured frames; see app.py /api/face) ────────────
     face_warn_seconds: float = float(os.getenv("FACE_WARN_SECONDS", "3"))
     face_exit_seconds: float = float(os.getenv("FACE_EXIT_SECONDS", "15"))
     face_auto_exit: bool = _get_bool("FACE_AUTO_EXIT", False)   # end interview when candidate leaves frame
 
     # ── Dev ─────────────────────────────────────────────────────────────────────
     dev_mode: bool = _get_bool("PRISM_DEV", False)             # enables the practice-session helper
+
+    # ── LLM (OpenAI-compatible endpoint, e.g. LM Studio / Ollama / vLLM) ──────────
+    # LLM_URL / LLM_MODEL are the canonical names; the older MISTRAL_* names are
+    # still honoured so existing .env files keep working unchanged.
+    llm_url: str = os.getenv("LLM_URL") or os.getenv("MISTRAL_URL", "http://127.0.0.1:1234/v1/chat/completions")
+    llm_model: str = os.getenv("LLM_MODEL") or os.getenv("MISTRAL_MODEL", "mistral-7b-instruct-v0.3")
+    llm_timeout: float = float(os.getenv("LLM_TIMEOUT", "60"))
+    llm_max_retries: int = int(os.getenv("LLM_MAX_RETRIES", "2"))
+
+    # ── Email (Gmail SMTP with an app password) ──────────────────────────────────
+    email_sender: Optional[str] = os.getenv("EMAIL_SENDER")
+    email_password: Optional[str] = os.getenv("EMAIL_PASSWORD")
+
+    # ── Uploads ──────────────────────────────────────────────────────────────────
+    # Hard cap on a single request body (resumes + JD together). Rejects oversized
+    # uploads before they can exhaust memory or disk. Default 25 MB.
+    max_content_length: int = int(os.getenv("MAX_CONTENT_LENGTH", str(25 * 1024 * 1024)))
+
+    # ── Interviewer agent ────────────────────────────────────────────────────────
+    # The interviewer runs as a tool-using agent: it asks the planned questions,
+    # may ask up to `agent_max_followups` dynamic follow-ups in total, and records
+    # a live assessment of each answer. Keep the budgets small so a weak local
+    # model stays on-task; `agent_max_steps` is a hard safety cap on loop length.
+    # ── Media features (per-interview) ───────────────────────────────────────────
+    # These are the DEFAULTS the recruiter dashboard can override per session (the
+    # chosen values are written into that session's meta.txt). When a feature is
+    # off, the candidate UI hides its controls entirely — no dead space.
+    tts_enabled_default: bool = _get_bool("TTS_ENABLED", False)        # Kokoro-82M reads questions aloud
+    stt_enabled_default: bool = _get_bool("STT_ENABLED", False)        # browser mic → server Whisper
+    camera_enabled_default: bool = _get_bool("CAMERA_ENABLED", False)  # webcam presence / face monitor
+    clarify_enabled_default: bool = _get_bool("CLARIFY_ENABLED", True) # candidate may ask the AI to clarify
+    clarify_max_per_question: int = int(os.getenv("CLARIFY_MAX_PER_QUESTION", "2"))
+
+    # ── TTS (Kokoro-82M) ─────────────────────────────────────────────────────────
+    tts_voice: str = os.getenv("TTS_VOICE", "af_heart")
+    tts_lang_code: str = os.getenv("TTS_LANG_CODE", "a")   # kokoro: 'a' = American English
+    tts_sample_rate: int = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
+
+    # ── STT (faster-whisper — the RealtimeSTT engine — on uploaded audio) ─────────
+    stt_model: str = os.getenv("STT_MODEL", "base.en")
+    stt_compute_type: str = os.getenv("STT_COMPUTE_TYPE", "int8")
+
+    # ── Device placement ─────────────────────────────────────────────────────────
+    # 'auto' | 'cpu' | 'cuda'. The LLM runs on the GPU (via LM Studio); audio models
+    # default to CPU so scarce VRAM stays free for the LLM. 'auto' only puts an audio
+    # model on the GPU when there is ample FREE VRAM (below).
+    stt_device: str = os.getenv("STT_DEVICE", "auto")
+    tts_device: str = os.getenv("TTS_DEVICE", "auto")
+    gpu_audio_min_free_vram_mb: int = int(os.getenv("GPU_AUDIO_MIN_FREE_VRAM_MB", "7000"))
+
+    agent_enabled: bool = _get_bool("AGENT_ENABLED", True)
+    agent_max_followups: int = int(os.getenv("AGENT_MAX_FOLLOWUPS", "3"))
+    # Extra CODING questions the agent may add when it isn't satisfied with a
+    # candidate's coding answer (own budget so verbal probes can't use them up).
+    agent_max_code_followups: int = int(os.getenv("AGENT_MAX_CODE_FOLLOWUPS", "2"))
+    # A coding answer scoring at or below this correctness (0-100, from the live
+    # review) is treated as "unsatisfactory" and nudges the agent to follow up
+    # with another coding question while its budget lasts.
+    agent_code_followup_threshold: int = int(os.getenv("AGENT_CODE_FOLLOWUP_THRESHOLD", "70"))
+    agent_max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "40"))
 
     # ── Interview rules ──────────────────────────────────────────────────────────
     # Shown as a pre-interview agreement gate the candidate must accept before
